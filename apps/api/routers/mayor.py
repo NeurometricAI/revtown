@@ -13,6 +13,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from apps.api.dependencies import CurrentUser, ScopedBeadStore, ScopedMayor
+from apps.api.core.convoy_store import (
+    Convoy, ConvoyStatus, ConvoyStep, StepStatus, get_convoy_store
+)
+from apps.api.core.convoy_executor import get_convoy_executor
 
 router = APIRouter()
 
@@ -27,6 +31,7 @@ class ChatRequest(BaseModel):
     """Request to chat with the Mayor."""
     message: str
     campaign_id: str | None = None
+    convoy_id: str | None = None
     conversation_history: list[ChatMessage] = []
 
 
@@ -207,31 +212,51 @@ async def _handle_create_campaign(
     budget = extracted.get("budget")
 
     try:
-        # Create campaign ID
+        # Create campaign and convoy IDs
         campaign_id = uuid4()
+        convoy_id = str(uuid4())
 
         # Create convoy plan using the Mayor
-        convoy = await mayor.create_convoy(
+        mayor_convoy = await mayor.create_convoy(
             campaign_id=campaign_id,
             goal=goal,
             budget_cents=int(budget * 100) if budget else None,
         )
 
-        convoy_steps = [
-            {
-                "id": step.id,
-                "rig": step.rig.value,
-                "polecat_type": step.polecat_type,
-                "status": step.status,
-                "description": f"Execute {step.polecat_type} via {step.rig.value}",
-            }
-            for step in convoy.steps
-        ]
+        # Convert Mayor convoy steps to ConvoyStep objects
+        convoy_steps_data = []
+        for step in mayor_convoy.steps:
+            convoy_step = ConvoyStep(
+                id=step.id,
+                rig=step.rig.value,
+                polecat_type=step.polecat_type,
+                description=f"Execute {step.polecat_type} via {step.rig.value}",
+                depends_on=step.depends_on,
+                priority=step.priority,
+            )
+            convoy_steps_data.append(convoy_step)
+
+        # Create and store the convoy
+        convoy_store = get_convoy_store()
+        convoy = Convoy(
+            id=convoy_id,
+            campaign_id=str(campaign_id),
+            campaign_name=campaign_name,
+            goal=goal,
+            organization_id=str(user.organization_id) if user.organization_id else "",
+            status=ConvoyStatus.DRAFT,
+            steps=convoy_steps_data,
+        )
+        convoy_store.create(convoy)
+
+        # Format steps for response
+        convoy_steps = [step.to_dict() for step in convoy.steps]
 
         return wrap_response(ChatResponse(
             response=f"I've created your campaign: **{campaign_name}**\n\nGoal: {goal}\n\nI've planned {len(convoy.steps)} steps across multiple Rigs to achieve this goal. Review the plan on the right, and say **\"start the campaign\"** when you're ready to begin execution!",
             campaign={
                 "id": str(campaign_id),
+                "convoy_id": convoy_id,
                 "name": campaign_name,
                 "goal": goal,
                 "status": "draft",
@@ -339,33 +364,62 @@ async def _handle_start_convoy(
             is_question=True,
         ).model_dump())
 
-    # For now, simulate starting the convoy by returning updated status
-    # In production, this would trigger actual Temporal workflows
+    # Get the convoy from the store
+    convoy_store = get_convoy_store()
+    convoys = convoy_store.get_by_campaign(campaign_id)
 
-    # Create simulated running convoy steps
-    # First few steps start running immediately
-    convoy_steps = [
-        {"id": "step_1", "rig": "intelligence_station", "polecat_type": "competitor_monitor", "status": "running", "description": "Analyzing competitor landscape"},
-        {"id": "step_2", "rig": "content_factory", "polecat_type": "content_calendar", "status": "running", "description": "Planning content schedule"},
-        {"id": "step_3", "rig": "content_factory", "polecat_type": "blog_draft", "status": "pending", "description": "Creating blog content"},
-        {"id": "step_4", "rig": "content_factory", "polecat_type": "seo_optimize", "status": "pending", "description": "Optimizing for search"},
-        {"id": "step_5", "rig": "landing_pad", "polecat_type": "landing_page_draft", "status": "pending", "description": "Building landing page"},
-        {"id": "step_6", "rig": "sdr_hive", "polecat_type": "lead_enrich", "status": "pending", "description": "Enriching lead data"},
-        {"id": "step_7", "rig": "sdr_hive", "polecat_type": "email_personalize", "status": "pending", "description": "Personalizing outreach"},
-        {"id": "step_8", "rig": "social_command", "polecat_type": "social_post", "status": "pending", "description": "Scheduling social posts"},
-    ]
+    if not convoys:
+        return wrap_response(ChatResponse(
+            response="I couldn't find a convoy for this campaign. Would you like me to create an execution plan first?",
+            is_question=True,
+        ).model_dump())
 
-    return wrap_response(ChatResponse(
-        response="**Campaign execution started!** 🚀\n\nI'm now orchestrating Polecats across your Rigs. The first tasks are already running:\n\n• **Competitor Monitor** - Analyzing your competitive landscape\n• **Content Calendar** - Planning your content schedule\n\nWatch the progress on the right panel. I'll notify you when tasks need approval or if I have questions.",
-        campaign={
-            "id": campaign_id,
-            "name": "Active Campaign",
-            "goal": "Campaign execution",
-            "status": "executing",
-        },
-        convoy_steps=convoy_steps,
-        action_taken="convoy_started",
-    ).model_dump())
+    convoy = convoys[-1]  # Get the most recent convoy
+
+    if convoy.status == ConvoyStatus.EXECUTING:
+        return wrap_response(ChatResponse(
+            response="This campaign is already running! Check the progress on the right panel.",
+            campaign={
+                "id": campaign_id,
+                "convoy_id": convoy.id,
+                "name": convoy.campaign_name,
+                "goal": convoy.goal,
+                "status": "executing",
+            },
+            convoy_steps=[step.to_dict() for step in convoy.steps],
+        ).model_dump())
+
+    try:
+        # Start the convoy execution
+        executor = get_convoy_executor()
+        convoy = await executor.start_convoy(convoy.id)
+
+        # Get running steps for the response message
+        running_steps = convoy.running_steps
+        running_names = [f"**{s.polecat_type.replace('_', ' ').title()}** - {s.description}" for s in running_steps[:3]]
+        running_list = "\n• ".join(running_names) if running_names else "Tasks are being prepared..."
+
+        return wrap_response(ChatResponse(
+            response=f"**Campaign execution started!** 🚀\n\nI'm now orchestrating Polecats across your Rigs. The first tasks are running:\n\n• {running_list}\n\nWatch the progress on the right panel. I'll notify you when tasks need approval or if I have questions.",
+            campaign={
+                "id": campaign_id,
+                "convoy_id": convoy.id,
+                "name": convoy.campaign_name,
+                "goal": convoy.goal,
+                "status": "executing",
+            },
+            convoy_steps=[step.to_dict() for step in convoy.steps],
+            action_taken="convoy_started",
+        ).model_dump())
+
+    except Exception as e:
+        import traceback
+        print(f"Start convoy error: {e}")
+        traceback.print_exc()
+        return wrap_response(ChatResponse(
+            response=f"I encountered an issue starting the campaign: {str(e)}. Would you like me to try again?",
+            is_question=True,
+        ).model_dump())
 
 
 async def _handle_general_question(
@@ -432,3 +486,51 @@ guide them towards that. Keep responses concise but helpful.
         return wrap_response(ChatResponse(
             response="Hello! I'm the GTM Mayor. I help plan and execute go-to-market campaigns. What would you like to accomplish today?",
         ).model_dump())
+
+
+@router.get("/convoy/{convoy_id}/status", response_model=dict)
+async def get_convoy_status(convoy_id: str):
+    """
+    Get the current status of a convoy.
+
+    Used by the frontend to poll for real-time updates.
+    """
+    convoy_store = get_convoy_store()
+    convoy = convoy_store.get(convoy_id)
+
+    if not convoy:
+        raise HTTPException(status_code=404, detail="Convoy not found")
+
+    return wrap_response({
+        "convoy": convoy.to_dict(),
+        "campaign": {
+            "id": convoy.campaign_id,
+            "name": convoy.campaign_name,
+            "goal": convoy.goal,
+            "status": convoy.status.value,
+        },
+    })
+
+
+@router.get("/campaign/{campaign_id}/convoy", response_model=dict)
+async def get_campaign_convoy(campaign_id: str):
+    """
+    Get the active convoy for a campaign.
+    """
+    convoy_store = get_convoy_store()
+    convoys = convoy_store.get_by_campaign(campaign_id)
+
+    if not convoys:
+        raise HTTPException(status_code=404, detail="No convoy found for campaign")
+
+    convoy = convoys[-1]  # Most recent
+
+    return wrap_response({
+        "convoy": convoy.to_dict(),
+        "campaign": {
+            "id": convoy.campaign_id,
+            "name": convoy.campaign_name,
+            "goal": convoy.goal,
+            "status": convoy.status.value,
+        },
+    })

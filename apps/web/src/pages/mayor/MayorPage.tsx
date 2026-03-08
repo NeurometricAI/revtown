@@ -18,6 +18,7 @@ interface ConvoyStep {
 
 interface Campaign {
   id: string;
+  convoy_id?: string;
   name: string;
   goal: string;
   status: string;
@@ -45,6 +46,39 @@ export function MayorPage() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  // Poll for convoy status updates when campaign is executing
+  useEffect(() => {
+    if (!activeCampaign?.convoy_id || activeCampaign?.status !== 'executing') {
+      return;
+    }
+
+    const pollStatus = async () => {
+      try {
+        const response = await fetch(`/api/v1/mayor/convoy/${activeCampaign.convoy_id}/status`);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.data?.convoy?.steps) {
+            setConvoySteps(data.data.convoy.steps);
+          }
+          // Update campaign status if convoy completed
+          if (data.data?.convoy?.status === 'completed' || data.data?.convoy?.status === 'failed') {
+            setActiveCampaign((prev) => prev ? { ...prev, status: data.data.convoy.status } : null);
+          }
+        }
+      } catch (error) {
+        console.error('Failed to poll convoy status:', error);
+      }
+    };
+
+    // Poll every 2 seconds
+    const interval = setInterval(pollStatus, 2000);
+
+    // Initial poll
+    pollStatus();
+
+    return () => clearInterval(interval);
+  }, [activeCampaign?.convoy_id, activeCampaign?.status]);
 
   const sendMessage = async () => {
     if (!input.trim() || isLoading) return;

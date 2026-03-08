@@ -10,11 +10,92 @@ These workflows define the durable execution patterns for:
 from datetime import timedelta
 from typing import Any
 
-from temporalio import workflow
+from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 
-# Import activities (defined in polecats/runner.py)
-# These are referenced by name for Temporal's serialization
+import structlog
+
+logger = structlog.get_logger()
+
+
+@activity.defn
+async def execute_convoy_step(
+    step: dict[str, Any],
+    convoy_id: str,
+    organization_id: str,
+) -> dict[str, Any]:
+    """
+    Execute a single convoy step by spawning its Polecat.
+
+    This activity:
+    1. Updates step status to 'running'
+    2. Spawns the Polecat via PolecatSpawner
+    3. Waits for completion
+    4. Updates step status with result
+    """
+    from uuid import uuid4
+
+    from apps.api.core.convoy_store import get_convoy_store, StepStatus
+    from polecats.runner import get_polecat_spawner
+
+    store = get_convoy_store()
+    spawner = get_polecat_spawner()
+
+    step_id = step["id"]
+    rig = step["rig"]
+    polecat_type = step["polecat_type"]
+
+    logger.info(
+        "Executing convoy step",
+        convoy_id=convoy_id,
+        step_id=step_id,
+        rig=rig,
+        polecat_type=polecat_type,
+    )
+
+    # Update step to running
+    store.update_step_status(convoy_id, step_id, StepStatus.RUNNING)
+
+    try:
+        # Create a temporary bead ID for this execution
+        # In production, this would create/use actual beads
+        bead_id = uuid4()
+
+        # Spawn the Polecat
+        execution_id = await spawner.spawn(
+            rig=rig,
+            polecat_type=polecat_type,
+            bead_id=bead_id,
+            organization_id=organization_id,
+            config=step.get("config", {}),
+        )
+
+        # Wait for result
+        result = await spawner.get_result(execution_id)
+
+        # Update step status
+        if result.get("success"):
+            store.update_step_status(
+                convoy_id, step_id, StepStatus.COMPLETED,
+                execution_id=execution_id,
+                result=result,
+            )
+        else:
+            store.update_step_status(
+                convoy_id, step_id, StepStatus.FAILED,
+                execution_id=execution_id,
+                error=result.get("error", "Unknown error"),
+            )
+
+        return result
+
+    except Exception as e:
+        logger.error("Step execution failed", step_id=step_id, error=str(e))
+        store.update_step_status(
+            convoy_id, step_id, StepStatus.FAILED,
+            error=str(e),
+        )
+        return {"success": False, "error": str(e)}
 
 
 @workflow.defn
@@ -35,8 +116,10 @@ class CampaignConvoyWorkflow:
     ) -> dict[str, Any]:
         """Execute the campaign convoy."""
 
+        convoy_id = convoy_plan.get("convoy_id")
         results = {
             "campaign_id": campaign_id,
+            "convoy_id": convoy_id,
             "steps_completed": 0,
             "steps_failed": 0,
             "outputs": [],
@@ -46,10 +129,10 @@ class CampaignConvoyWorkflow:
 
         for step in steps:
             try:
-                # Execute step
+                # Execute step - pass convoy_id along with step and org_id
                 step_result = await workflow.execute_activity(
-                    "execute_convoy_step",
-                    args=[step, organization_id],
+                    execute_convoy_step,
+                    args=[step, convoy_id, organization_id],
                     start_to_close_timeout=timedelta(minutes=30),
                     retry_policy=RetryPolicy(
                         initial_interval=timedelta(seconds=5),
