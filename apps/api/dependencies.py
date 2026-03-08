@@ -14,6 +14,11 @@ from apps.api.config import settings
 from apps.api.core.bead_store import BeadStore, get_session_factory
 from apps.api.middleware.error_handler import AuthenticationError, AuthorizationError
 
+# Forward reference for Mayor (imported in function to avoid circular imports)
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from apps.api.core.mayor import Mayor
+
 # Security scheme
 security = HTTPBearer(auto_error=False)
 
@@ -176,3 +181,24 @@ ScopedBeadStore = Annotated[BeadStore, Depends(get_bead_store)]
 # Role-based dependencies
 AdminUser = Annotated[TokenData, Depends(require_role(["owner", "admin"]))]
 OwnerUser = Annotated[TokenData, Depends(require_role(["owner"]))]
+
+
+# =============================================================================
+# Mayor (GTM Orchestration)
+# =============================================================================
+
+
+async def get_mayor(
+    store: Annotated[BeadStore, Depends(get_bead_store)],
+    user: Annotated[TokenData, Depends(get_current_user)],
+):
+    """Get a Mayor instance scoped to the current organization."""
+    from apps.api.core.mayor import Mayor
+
+    return Mayor(
+        bead_store=store,
+        organization_id=user.organization_id,
+    )
+
+
+ScopedMayor = Annotated["Mayor", Depends(get_mayor)]

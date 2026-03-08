@@ -8,9 +8,9 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 
-from apps.api.dependencies import CurrentUser, ScopedBeadStore
+from apps.api.dependencies import CurrentUser, ScopedBeadStore, ScopedMayor
 from apps.api.models.beads import CampaignBead, CampaignBeadCreate, CampaignBeadUpdate
 
 router = APIRouter()
@@ -105,6 +105,7 @@ async def create_convoy(
     campaign_id: UUID,
     store: ScopedBeadStore,
     user: CurrentUser,
+    mayor: ScopedMayor,
 ):
     """
     Create a Convoy for a Campaign.
@@ -114,12 +115,35 @@ async def create_convoy(
     2. Create a sequenced set of Beads
     3. Distribute work across appropriate Rigs
     """
-    # TODO: Implement via Mayor
+    # Get the campaign to extract goal and budget
+    campaign = await store.get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Create convoy via Mayor
+    convoy = await mayor.create_convoy(
+        campaign_id=campaign_id,
+        goal=campaign.goal or campaign.name,
+        budget_cents=int(campaign.budget * 100) if campaign.budget else None,
+        horizon_days=30,  # Default horizon
+    )
+
     return wrap_response({
         "campaign_id": str(campaign_id),
-        "convoy_id": "todo",
-        "status": "creating",
-        "message": "Convoy creation initiated - Mayor will plan execution",
+        "convoy_id": convoy.id,
+        "status": convoy.status.value,
+        "steps": [
+            {
+                "id": step.id,
+                "rig": step.rig.value,
+                "polecat_type": step.polecat_type,
+                "priority": step.priority,
+                "status": step.status,
+                "depends_on": step.depends_on,
+            }
+            for step in convoy.steps
+        ],
+        "message": "Convoy created - ready to start execution",
     })
 
 
@@ -128,13 +152,49 @@ async def get_convoy_status(
     campaign_id: UUID,
     store: ScopedBeadStore,
     user: CurrentUser,
+    mayor: ScopedMayor,
 ):
     """Get the current Convoy status for a Campaign."""
-    # TODO: Implement convoy tracking
+    convoys = mayor.get_active_convoys(campaign_id)
+
+    if not convoys:
+        return wrap_response({
+            "campaign_id": str(campaign_id),
+            "convoy": None,
+            "message": "No active convoy for this campaign",
+        })
+
+    # Return the most recent convoy
+    convoy = convoys[-1]
+
     return wrap_response({
         "campaign_id": str(campaign_id),
-        "convoy": None,
-        "message": "No active convoy for this campaign",
+        "convoy": {
+            "id": convoy.id,
+            "status": convoy.status.value,
+            "goal": convoy.goal,
+            "created_at": convoy.created_at.isoformat(),
+            "steps": [
+                {
+                    "id": step.id,
+                    "rig": step.rig.value,
+                    "polecat_type": step.polecat_type,
+                    "priority": step.priority,
+                    "status": step.status,
+                    "depends_on": step.depends_on,
+                    "started_at": step.started_at.isoformat() if step.started_at else None,
+                    "completed_at": step.completed_at.isoformat() if step.completed_at else None,
+                }
+                for step in convoy.steps
+            ],
+            "progress": {
+                "total": len(convoy.steps),
+                "completed": len([s for s in convoy.steps if s.status == "completed"]),
+                "running": len([s for s in convoy.steps if s.status == "running"]),
+                "pending": len([s for s in convoy.steps if s.status == "pending"]),
+                "failed": len([s for s in convoy.steps if s.status == "failed"]),
+            },
+        },
     })
 
 
@@ -143,12 +203,22 @@ async def pause_convoy(
     campaign_id: UUID,
     store: ScopedBeadStore,
     user: CurrentUser,
+    mayor: ScopedMayor,
 ):
     """Pause the active Convoy for a Campaign."""
-    # TODO: Implement
+    convoys = mayor.get_active_convoys(campaign_id)
+
+    if not convoys:
+        raise HTTPException(status_code=404, detail="No active convoy for this campaign")
+
+    convoy = convoys[-1]
+    paused_convoy = await mayor.pause_convoy(convoy.id)
+
     return wrap_response({
         "campaign_id": str(campaign_id),
-        "status": "paused",
+        "convoy_id": paused_convoy.id,
+        "status": paused_convoy.status.value,
+        "message": "Convoy paused",
     })
 
 
@@ -157,12 +227,47 @@ async def resume_convoy(
     campaign_id: UUID,
     store: ScopedBeadStore,
     user: CurrentUser,
+    mayor: ScopedMayor,
 ):
     """Resume a paused Convoy."""
-    # TODO: Implement
+    convoys = mayor.get_active_convoys(campaign_id)
+
+    if not convoys:
+        raise HTTPException(status_code=404, detail="No active convoy for this campaign")
+
+    convoy = convoys[-1]
+    resumed_convoy = await mayor.resume_convoy(convoy.id)
+
     return wrap_response({
         "campaign_id": str(campaign_id),
-        "status": "resumed",
+        "convoy_id": resumed_convoy.id,
+        "status": resumed_convoy.status.value,
+        "message": "Convoy resumed",
+    })
+
+
+@router.post("/{campaign_id}/convoy/start", response_model=dict)
+async def start_convoy(
+    campaign_id: UUID,
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    mayor: ScopedMayor,
+):
+    """Start executing a Convoy."""
+    convoys = mayor.get_active_convoys(campaign_id)
+
+    if not convoys:
+        raise HTTPException(status_code=404, detail="No convoy for this campaign - create one first")
+
+    convoy = convoys[-1]
+    started_convoy = await mayor.start_convoy(convoy.id)
+
+    return wrap_response({
+        "campaign_id": str(campaign_id),
+        "convoy_id": started_convoy.id,
+        "status": started_convoy.status.value,
+        "ready_steps": len(started_convoy.ready_steps),
+        "message": "Convoy execution started",
     })
 
 
