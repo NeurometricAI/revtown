@@ -141,7 +141,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - REVTOWN_MODE=saas
+      - REVTOWN_MODE=self-hosted
       - REVTOWN_ENV=development
       - DEBUG=true
       - DOLT_HOST=dolt
