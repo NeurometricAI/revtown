@@ -1,8 +1,8 @@
 """
 Neurometric Client - Gateway for all LLM calls.
 
-IMPORTANT: Every AI API call must be routed through the Neurometric gateway.
-No direct calls to Claude, OpenAI, or any model provider.
+Currently using direct Anthropic API. Will be replaced with Neurometric gateway
+once it's fully deployed.
 """
 
 from dataclasses import dataclass
@@ -20,7 +20,7 @@ logger = structlog.get_logger()
 
 @dataclass
 class NeurometricResponse:
-    """Response from Neurometric API."""
+    """Response from LLM API."""
 
     content: str
     model_used: str
@@ -32,7 +32,7 @@ class NeurometricResponse:
 
 
 class NeurometricError(Exception):
-    """Error from Neurometric gateway."""
+    """Error from LLM gateway."""
 
     def __init__(self, message: str, code: str | None = None, details: dict | None = None):
         self.message = message
@@ -43,23 +43,35 @@ class NeurometricError(Exception):
 
 class NeurometricClient:
     """
-    Client for the Neurometric AI gateway.
+    Client for LLM completions.
 
-    All LLM calls route through here for:
-    - Model selection based on task class
-    - Usage tracking and metering
-    - Shadow testing for model optimization
-    - Rate limiting and quota enforcement
+    Currently using direct Anthropic API. Will migrate to Neurometric gateway.
     """
+
+    # Anthropic API configuration
+    ANTHROPIC_API_URL = "https://api.anthropic.com"
+    ANTHROPIC_VERSION = "2023-06-01"
+
+    # Model mapping for task classes
+    TASK_CLASS_MODELS: dict[str, str] = {
+        "mayor_intent_analysis": "claude-sonnet-4-5-20250929",
+        "mayor_convoy_planning": "claude-sonnet-4-5-20250929",
+        "mayor_conversation": "claude-sonnet-4-5-20250929",
+        "mayor_general_qa": "claude-sonnet-4-5-20250929",
+        "mayor_re_slate": "claude-sonnet-4-5-20250929",
+        "blog_draft": "claude-sonnet-4-5-20250929",
+        "email_personalization": "claude-haiku-3-5-20241022",
+        "subject_line": "claude-haiku-3-5-20241022",
+        "pr_pitch": "claude-sonnet-4-5-20250929",
+    }
 
     def __init__(
         self,
-        api_url: str | None = None,
         api_key: str | None = None,
         organization_id: UUID | None = None,
     ):
-        self.api_url = api_url or settings.neurometric_api_url
-        self.api_key = api_key or settings.neurometric_api_key
+        # Use Anthropic API key (stored in same env var for now)
+        self.api_key = api_key or settings.anthropic_api_key
         self.organization_id = organization_id
         self.logger = logger.bind(
             service="neurometric",
@@ -71,12 +83,13 @@ class NeurometricClient:
         """Get or create the HTTP client."""
         if self._client is None:
             self._client = httpx.AsyncClient(
-                base_url=self.api_url,
+                base_url=self.ANTHROPIC_API_URL,
                 headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "X-Organization-ID": str(self.organization_id) if self.organization_id else "",
+                    "x-api-key": self.api_key,
+                    "anthropic-version": self.ANTHROPIC_VERSION,
+                    "content-type": "application/json",
                 },
-                timeout=60.0,
+                timeout=120.0,
             )
         return self._client
 
@@ -96,14 +109,14 @@ class NeurometricClient:
         model_override: str | None = None,
     ) -> NeurometricResponse:
         """
-        Make an LLM completion request through Neurometric.
+        Make an LLM completion request.
 
         Args:
             task_class: The type of task (e.g., "blog_draft", "email_personalization")
             prompt: The prompt to send to the model
             context: Additional context for the request
-            max_tokens: Override max tokens (uses registry default if not specified)
-            temperature: Override temperature (uses registry default if not specified)
+            max_tokens: Override max tokens (default 4096)
+            temperature: Override temperature
             model_override: Force a specific model (for testing)
 
         Returns:
@@ -111,61 +124,73 @@ class NeurometricClient:
         """
         start_time = datetime.utcnow()
 
-        request_body = {
-            "task_class": task_class,
-            "prompt": prompt,
-            "context": context or {},
+        # Select model based on task class or override
+        model = model_override or self.TASK_CLASS_MODELS.get(
+            task_class, "claude-sonnet-4-5-20250929"
+        )
+
+        # Build Anthropic Messages API request body
+        request_body: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens or 4096,
+            "messages": [{"role": "user", "content": prompt}],
         }
 
-        if max_tokens:
-            request_body["max_tokens"] = max_tokens
         if temperature is not None:
             request_body["temperature"] = temperature
-        if model_override:
-            request_body["model_override"] = model_override
 
         self.logger.info(
-            "Making Neurometric completion request",
+            "Making Anthropic completion request",
             task_class=task_class,
+            model=model,
             prompt_length=len(prompt),
         )
 
         try:
             client = await self._get_client()
-            response = await client.post("/v1/complete", json=request_body)
+            response = await client.post("/v1/messages", json=request_body)
 
             if response.status_code != 200:
                 error_data = response.json() if response.content else {}
+                error_msg = error_data.get("error", {}).get("message", f"Request failed with status {response.status_code}")
                 raise NeurometricError(
-                    message=error_data.get("message", f"Request failed with status {response.status_code}"),
-                    code=error_data.get("code"),
+                    message=error_msg,
+                    code=error_data.get("error", {}).get("type"),
                     details=error_data,
                 )
 
             data = response.json()
             latency_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
 
+            # Extract content from Anthropic response
+            content = ""
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    content += block.get("text", "")
+
+            usage = data.get("usage", {})
+
             self.logger.info(
-                "Neurometric completion successful",
+                "Anthropic completion successful",
                 task_class=task_class,
-                model_used=data.get("model"),
-                tokens_input=data.get("tokens_input"),
-                tokens_output=data.get("tokens_output"),
+                model_used=data.get("model", model),
+                tokens_input=usage.get("input_tokens", 0),
+                tokens_output=usage.get("output_tokens", 0),
                 latency_ms=latency_ms,
             )
 
             return NeurometricResponse(
-                content=data["content"],
-                model_used=data.get("model", "unknown"),
-                tokens_input=data.get("tokens_input", 0),
-                tokens_output=data.get("tokens_output", 0),
+                content=content,
+                model_used=data.get("model", model),
+                tokens_input=usage.get("input_tokens", 0),
+                tokens_output=usage.get("output_tokens", 0),
                 latency_ms=latency_ms,
                 task_class=task_class,
-                metadata=data.get("metadata"),
+                metadata={"id": data.get("id")},
             )
 
         except httpx.RequestError as e:
-            self.logger.error("Neurometric request failed", error=str(e))
+            self.logger.error("Anthropic request failed", error=str(e))
             raise NeurometricError(
                 message=f"Request failed: {e}",
                 code="REQUEST_ERROR",
@@ -179,7 +204,7 @@ class NeurometricClient:
         """
         try:
             client = await self._get_client()
-            response = await client.get(f"/v1/registry/{task_class}")
+            response = await client.get(f"/registry/{task_class}")
 
             if response.status_code == 404:
                 return {
@@ -219,7 +244,7 @@ class NeurometricClient:
         try:
             client = await self._get_client()
             await client.post(
-                "/v1/quality/report",
+                "/quality/report",
                 json={
                     "task_class": task_class,
                     "model": model_used,
@@ -245,7 +270,7 @@ class NeurometricClient:
         """
         try:
             client = await self._get_client()
-            response = await client.get(f"/v1/efficiency?days={days}")
+            response = await client.get(f"/efficiency?days={days}")
 
             if response.status_code != 200:
                 return {"error": "Failed to get efficiency report"}

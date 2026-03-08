@@ -346,19 +346,77 @@ export function MayorPage() {
         </div>
 
         {/* Actions */}
-        {convoySteps.length > 0 && (
+        {convoySteps.length > 0 && activeCampaign?.status === 'draft' && (
           <div className="p-4 border-t border-gray-200">
             <button
-              className="w-full py-2 px-4 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 transition-colors"
-              onClick={() => {
-                // Start convoy execution
-                fetch(`/api/v1/campaigns/${activeCampaign?.id}/convoy/start`, {
-                  method: 'POST',
-                });
+              className="w-full py-2 px-4 bg-indigo-600 text-white rounded-lg font-medium hover:bg-indigo-700 transition-colors disabled:opacity-50"
+              disabled={isLoading}
+              onClick={async () => {
+                // Start convoy via chat message
+                setInput('Start the campaign');
+                const userMessage: Message = {
+                  id: Date.now().toString(),
+                  role: 'user',
+                  content: 'Start the campaign',
+                  timestamp: new Date(),
+                };
+                setMessages((prev) => [...prev, userMessage]);
+                setIsLoading(true);
+
+                try {
+                  const response = await fetch('/api/v1/mayor/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      message: 'Start the campaign',
+                      campaign_id: activeCampaign?.id,
+                      conversation_history: messages.map((m) => ({
+                        role: m.role,
+                        content: m.content,
+                      })),
+                    }),
+                  });
+
+                  const data = await response.json();
+
+                  const mayorMessage: Message = {
+                    id: (Date.now() + 1).toString(),
+                    role: 'mayor',
+                    content: data.data.response,
+                    timestamp: new Date(),
+                  };
+                  setMessages((prev) => [...prev, mayorMessage]);
+
+                  if (data.data.campaign) {
+                    setActiveCampaign(data.data.campaign);
+                  }
+                  if (data.data.convoy_steps) {
+                    setConvoySteps(data.data.convoy_steps);
+                  }
+                } catch (error) {
+                  const errorMessage: Message = {
+                    id: (Date.now() + 1).toString(),
+                    role: 'mayor',
+                    content: 'Sorry, I encountered an error starting the campaign.',
+                    timestamp: new Date(),
+                  };
+                  setMessages((prev) => [...prev, errorMessage]);
+                } finally {
+                  setIsLoading(false);
+                  setInput('');
+                }
               }}
             >
-              Start Execution
+              {isLoading ? 'Starting...' : 'Start Execution'}
             </button>
+          </div>
+        )}
+        {convoySteps.length > 0 && activeCampaign?.status === 'executing' && (
+          <div className="p-4 border-t border-gray-200">
+            <div className="flex items-center justify-center gap-2 text-green-600">
+              <span className="animate-pulse">●</span>
+              <span className="font-medium">Campaign Running</span>
+            </div>
           </div>
         )}
       </div>

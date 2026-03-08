@@ -77,7 +77,7 @@ services:
     volumes:
       - ./infra/temporal/dynamic-config.yaml:/etc/temporal/dynamic-config.yaml:ro
     healthcheck:
-      test: ["CMD", "temporal", "operator", "cluster", "health"]
+      test: ["CMD-SHELL", "tctl --address $(hostname -i):7233 cluster health | grep -q SERVING"]
       interval: 10s
       timeout: 10s
       retries: 30
@@ -151,6 +151,9 @@ services:
       - TEMPORAL_HOST=temporal:7233
       - VAULT_ADDR=http://vault:8200
       - VAULT_TOKEN=revtown-dev-token
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - NEUROMETRIC_API_URL=${NEUROMETRIC_API_URL:-https://api.neurometric.ai/v1}
+      - NEUROMETRIC_API_KEY=${NEUROMETRIC_API_KEY:-}
     volumes:
       - ./apps:/app/apps
       - ./polecats:/app/polecats

@@ -188,27 +188,27 @@ Budget: ${(budget_cents or 0) / 100:.2f}
 Timeline: {horizon_days or 30} days
 
 Available Rigs and their capabilities:
-- content_factory: Blog posts, social content, case studies
-- sdr_hive: Lead enrichment, email sequences, outreach
-- social_command: Social media posting, engagement
+- content_factory: Blog posts, social content, case studies, SEO optimization
+- sdr_hive: Lead enrichment, email sequences, personalized outreach
+- social_command: Social media posting, engagement, hashtag research
 - press_room: PR pitches, journalist outreach
 - intelligence_station: Competitor monitoring
 - landing_pad: Landing pages, A/B testing
 - wire: SMS outreach (human-assisted)
 - repo_watch: GitHub/developer content
 
-Create a campaign execution plan. Output as JSON:
+Create a comprehensive campaign execution plan with 5-8 steps. Respond with ONLY valid JSON (no markdown, no explanation):
 {{
     "phases": [
         {{
             "name": "Phase name",
-            "rigs": ["rig1", "rig2"],
+            "rigs": ["content_factory", "sdr_hive"],
             "steps": [
                 {{
-                    "rig": "rig_name",
-                    "polecat_type": "polecat_type",
+                    "rig": "content_factory",
+                    "polecat_type": "blog_draft",
                     "description": "What this step does",
-                    "depends_on": ["step_id"],
+                    "depends_on": [],
                     "priority": 1
                 }}
             ]
@@ -217,7 +217,14 @@ Create a campaign execution plan. Output as JSON:
     "estimated_duration_days": 14,
     "success_metrics": ["metric1", "metric2"]
 }}
-"""
+
+Use these polecat_type values:
+- content_factory: blog_draft, seo_optimize, social_snippet, content_calendar
+- sdr_hive: lead_enrich, email_personalize, sequence_create
+- social_command: social_post, engagement_monitor
+- landing_pad: landing_page_draft, ab_test_setup
+
+Respond with ONLY the JSON object, nothing else."""
 
         try:
             response = await self.neurometric.complete(
@@ -227,29 +234,84 @@ Create a campaign execution plan. Output as JSON:
             )
 
             import json
-            return json.loads(response.content)
+            import re
+
+            # Clean up the response - remove markdown code blocks if present
+            content = response.content.strip()
+            if content.startswith("```"):
+                content = re.sub(r'^```(?:json)?\s*', '', content)
+                content = re.sub(r'\s*```$', '', content)
+
+            return json.loads(content)
 
         except Exception as e:
             self.logger.error("Convoy planning failed", error=str(e))
-            # Return a basic fallback plan
+            # Return a comprehensive fallback plan
             return {
                 "phases": [
                     {
-                        "name": "Initial Content",
+                        "name": "Content Creation",
                         "rigs": ["content_factory"],
                         "steps": [
                             {
                                 "rig": "content_factory",
                                 "polecat_type": "blog_draft",
-                                "description": "Create initial blog content",
+                                "description": "Create initial blog content targeting key topics",
                                 "depends_on": [],
                                 "priority": 1,
-                            }
+                            },
+                            {
+                                "rig": "content_factory",
+                                "polecat_type": "seo_optimize",
+                                "description": "Optimize content for search engines",
+                                "depends_on": [],
+                                "priority": 2,
+                            },
                         ],
-                    }
+                    },
+                    {
+                        "name": "Landing & Conversion",
+                        "rigs": ["landing_pad"],
+                        "steps": [
+                            {
+                                "rig": "landing_pad",
+                                "polecat_type": "landing_page_draft",
+                                "description": "Create conversion-optimized landing page",
+                                "depends_on": [],
+                                "priority": 3,
+                            },
+                        ],
+                    },
+                    {
+                        "name": "Outreach",
+                        "rigs": ["sdr_hive", "social_command"],
+                        "steps": [
+                            {
+                                "rig": "sdr_hive",
+                                "polecat_type": "lead_enrich",
+                                "description": "Enrich lead data with firmographics",
+                                "depends_on": [],
+                                "priority": 4,
+                            },
+                            {
+                                "rig": "sdr_hive",
+                                "polecat_type": "email_personalize",
+                                "description": "Create personalized email sequences",
+                                "depends_on": [],
+                                "priority": 5,
+                            },
+                            {
+                                "rig": "social_command",
+                                "polecat_type": "social_post",
+                                "description": "Schedule social media content",
+                                "depends_on": [],
+                                "priority": 6,
+                            },
+                        ],
+                    },
                 ],
                 "estimated_duration_days": horizon_days or 30,
-                "success_metrics": ["content_created"],
+                "success_metrics": ["leads_generated", "content_published", "email_sent"],
             }
 
     async def _create_convoy_steps(

@@ -68,9 +68,12 @@ class Settings(BaseSettings):
     api_key_prefix: str = "rtk_"
 
     # =========================================================================
-    # Neurometric Gateway
+    # LLM API (Anthropic direct, will migrate to Neurometric)
     # =========================================================================
-    neurometric_api_url: str = "https://api.neurometric.ai"
+    anthropic_api_key: str = ""
+
+    # Neurometric Gateway (for future use)
+    neurometric_api_url: str = "https://api.neurometric.ai/v1"
     neurometric_api_key: str = ""
 
     # =========================================================================
