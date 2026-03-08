@@ -18,6 +18,7 @@ from apps.api.routers import (
     beads,
     billing,
     campaigns,
+    mayor,
     neurometric,
     orgs,
     plugins,
@@ -130,6 +131,9 @@ async def generic_exception_handler(request: Request, exc: Exception):
 # Core Bead operations
 app.include_router(beads.router, prefix="/api/v1/beads", tags=["Beads"])
 app.include_router(campaigns.router, prefix="/api/v1/campaigns", tags=["Campaigns"])
+
+# Mayor (conversational campaign orchestration)
+app.include_router(mayor.router, prefix="/api/v1/mayor", tags=["Mayor"])
 
 # Polecat execution
 app.include_router(polecats.router, prefix="/api/v1/polecats", tags=["Polecats"])

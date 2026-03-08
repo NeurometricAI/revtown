@@ -7,12 +7,14 @@ import {
   BarChart3,
   Menu,
   X,
+  Crown,
 } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
+  { name: 'Mayor', href: '/mayor', icon: Crown },
   { name: 'Campaigns', href: '/campaigns', icon: Rocket },
   { name: 'Approve', href: '/approve', icon: CheckCircle },
   { name: 'Optimize', href: '/optimize', icon: BarChart3 },

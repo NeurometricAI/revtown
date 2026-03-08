@@ -5,12 +5,14 @@ import { ApprovePage } from './pages/approve/ApprovePage';
 import { OptimizePage } from './pages/optimize/OptimizePage';
 import { CampaignsPage } from './pages/campaigns/CampaignsPage';
 import { DashboardPage } from './pages/DashboardPage';
+import { MayorPage } from './pages/mayor/MayorPage';
 
 function App() {
   return (
     <Routes>
       <Route path="/" element={<Layout />}>
         <Route index element={<DashboardPage />} />
+        <Route path="mayor" element={<MayorPage />} />
         <Route path="campaigns/*" element={<CampaignsPage />} />
         <Route path="admin/*" element={<AdminPage />} />
         <Route path="approve/*" element={<ApprovePage />} />
