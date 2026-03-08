@@ -1,6 +1,10 @@
 -- RevTown Database Schema
 -- All Bead types are defined here for Dolt (git-versioned MySQL-compatible DB)
 
+-- Create and use the revtown database
+CREATE DATABASE IF NOT EXISTS revtown;
+USE revtown;
+
 -- =============================================================================
 -- Core Tables (SaaS Platform)
 -- =============================================================================
