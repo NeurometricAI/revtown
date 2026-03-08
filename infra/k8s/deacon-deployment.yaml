@@ -1,0 +1,48 @@
+---
+# Deacon Deployment (Background janitor process)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: revtown-deacon
+  namespace: revtown-core
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: deacon
+spec:
+  replicas: 1  # Single Deacon instance
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: revtown
+      app.kubernetes.io/component: deacon
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: revtown
+        app.kubernetes.io/component: deacon
+    spec:
+      serviceAccountName: revtown-deacon
+      containers:
+        - name: deacon
+          image: revtown/deacon:latest
+          command: ["python", "-m", "apps.api.core.deacon"]
+          envFrom:
+            - configMapRef:
+                name: revtown-config
+            - secretRef:
+                name: revtown-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: revtown-deacon
+  namespace: revtown-core
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: deacon

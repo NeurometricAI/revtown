@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: revtown-core
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - api-deployment.yaml
+  - mayor-deployment.yaml
+  - deacon-deployment.yaml
+  - polecat-job-template.yaml
+  - ingress.yaml
+
+# Common labels for all resources
+commonLabels:
+  app.kubernetes.io/name: revtown
+  app.kubernetes.io/part-of: revtown-platform
+
+# Images to be overridden by overlays
+images:
+  - name: revtown/api
+    newTag: latest
+  - name: revtown/web
+    newTag: latest
+  - name: revtown/polecat-runner
+    newTag: latest

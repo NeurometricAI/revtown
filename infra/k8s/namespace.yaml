@@ -1,0 +1,92 @@
+---
+# RevTown Kubernetes Namespaces
+# One namespace per Rig + core services
+
+# Core Services Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-core
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: core
+---
+# Content Factory Rig
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-content-factory
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: rig
+    revtown.io/rig: content-factory
+---
+# SDR Hive Rig
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-sdr-hive
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: rig
+    revtown.io/rig: sdr-hive
+---
+# Social Command Rig
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-social-command
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: rig
+    revtown.io/rig: social-command
+---
+# Press Room Rig
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-press-room
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: rig
+    revtown.io/rig: press-room
+---
+# Intelligence Station Rig
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-intelligence-station
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: rig
+    revtown.io/rig: intelligence-station
+---
+# Landing Pad Rig
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-landing-pad
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: rig
+    revtown.io/rig: landing-pad
+---
+# The Wire Rig
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-wire
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: rig
+    revtown.io/rig: wire
+---
+# Repo Watch Rig
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: revtown-repo-watch
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: rig
+    revtown.io/rig: repo-watch

@@ -1,0 +1,53 @@
+---
+# GTM Mayor Deployment (Long-lived orchestration agent)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: revtown-mayor
+  namespace: revtown-core
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: mayor
+spec:
+  replicas: 1  # Single Mayor instance
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: revtown
+      app.kubernetes.io/component: mayor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: revtown
+        app.kubernetes.io/component: mayor
+    spec:
+      serviceAccountName: revtown-mayor
+      containers:
+        - name: mayor
+          image: revtown/mayor:latest
+          envFrom:
+            - configMapRef:
+                name: revtown-config
+            - secretRef:
+                name: revtown-secrets
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: revtown-mayor
+  namespace: revtown-core
+  labels:
+    app.kubernetes.io/name: revtown
+    app.kubernetes.io/component: mayor

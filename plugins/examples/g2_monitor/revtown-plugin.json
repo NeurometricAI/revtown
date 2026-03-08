@@ -1,0 +1,77 @@
+{
+  "name": "revtown-g2-monitor",
+  "version": "1.0.0",
+  "description": "G2 review sentiment analysis plugin for RevTown Intelligence Station",
+  "author": "RevTown Team",
+  "license": "MIT",
+  "homepage": "https://github.com/revtown/plugins/g2-monitor",
+
+  "polecats": [
+    {
+      "name": "G2ReviewAnalyzer",
+      "task_class": "g2_review_analysis",
+      "rig": "intelligence_station",
+      "content_type": "blog",
+      "description": "Analyze G2 reviews for sentiment, trends, and competitive insights",
+      "always_requires_approval": false
+    },
+    {
+      "name": "G2CompetitorCompare",
+      "task_class": "g2_competitor_compare",
+      "rig": "intelligence_station",
+      "content_type": "blog",
+      "description": "Compare G2 ratings and reviews with competitors",
+      "always_requires_approval": false
+    }
+  ],
+
+  "refinery_checks": [
+    {
+      "name": "g2_rating_verification",
+      "content_types": ["blog", "landing_page", "email"],
+      "description": "Verify G2 ratings and statistics cited in content are accurate",
+      "severity": "warn"
+    },
+    {
+      "name": "g2_badge_compliance",
+      "content_types": ["landing_page", "email"],
+      "description": "Verify G2 badge usage follows G2's brand guidelines",
+      "severity": "fail"
+    }
+  ],
+
+  "health_endpoint": "/health",
+
+  "required_credentials": [
+    "g2_api_key"
+  ],
+
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "review_limit": {
+        "type": "integer",
+        "default": 100,
+        "description": "Maximum reviews to analyze per run"
+      },
+      "sentiment_threshold": {
+        "type": "number",
+        "default": 0.7,
+        "description": "Minimum sentiment score to flag as positive"
+      },
+      "competitor_products": {
+        "type": "array",
+        "items": {"type": "string"},
+        "default": [],
+        "description": "G2 product slugs for competitors to monitor"
+      },
+      "alert_on_negative": {
+        "type": "boolean",
+        "default": true,
+        "description": "Send alerts for negative review trends"
+      }
+    }
+  },
+
+  "min_revtown_version": "0.1.0"
+}

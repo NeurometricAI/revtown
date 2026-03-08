@@ -1,0 +1,123 @@
+[tool.poetry]
+name = "revtown"
+version = "0.1.0"
+description = "Kubernetes for GTM Agents — An autonomous go-to-market execution platform"
+authors = ["RevTown Team"]
+readme = "README.md"
+packages = [
+    { include = "apps" },
+    { include = "polecats" },
+    { include = "plugins" },
+    { include = "rigs" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+# Web Framework
+fastapi = "^0.109.0"
+uvicorn = { extras = ["standard"], version = "^0.27.0" }
+pydantic = "^2.5.0"
+pydantic-settings = "^2.1.0"
+
+# Database
+doltcli = "^0.1.0"
+sqlalchemy = "^2.0.0"
+pymysql = "^1.1.0"
+
+# Message Queue
+aiokafka = "^0.10.0"
+
+# Temporal
+temporalio = "^1.4.0"
+
+# Authentication & Security
+python-jose = { extras = ["cryptography"], version = "^3.3.0" }
+passlib = { extras = ["bcrypt"], version = "^1.7.4" }
+python-multipart = "^0.0.6"
+
+# Vault
+hvac = "^2.1.0"
+
+# Stripe
+stripe = "^7.0.0"
+
+# External Services
+twilio = "^8.10.0"
+httpx = "^0.26.0"
+
+# Scheduling
+apscheduler = "^3.10.0"
+
+# Utilities
+python-dotenv = "^1.0.0"
+structlog = "^24.1.0"
+tenacity = "^8.2.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-asyncio = "^0.23.0"
+pytest-cov = "^4.1.0"
+httpx = "^0.26.0"
+ruff = "^0.1.0"
+mypy = "^1.8.0"
+pre-commit = "^3.6.0"
+faker = "^22.0.0"
+
+[tool.poetry.scripts]
+revtown-api = "apps.api.main:run"
+revtown-deacon = "apps.api.core.deacon:run"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "B904",   # raise without from inside except
+]
+
+[tool.ruff.isort]
+known-first-party = ["apps", "polecats", "plugins", "rigs"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "doltcli.*",
+    "temporalio.*",
+    "aiokafka.*",
+    "hvac.*",
+    "twilio.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --cov=apps --cov=polecats --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["apps", "polecats"]
+omit = ["**/tests/*", "**/__pycache__/*"]

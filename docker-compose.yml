@@ -1,0 +1,193 @@
+version: "3.8"
+
+services:
+  # =============================================================================
+  # Dolt Database (Git-versioned MySQL-compatible database for Beads)
+  # =============================================================================
+  dolt:
+    image: dolthub/dolt-sql-server:latest
+    container_name: revtown-dolt
+    ports:
+      - "3306:3306"
+    environment:
+      DOLT_ROOT_PASSWORD: ""
+    volumes:
+      - dolt-data:/var/lib/dolt
+      - ./db/schema:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # Redpanda (Kafka-compatible message queue - lighter for local dev)
+  # =============================================================================
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: revtown-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --overprovisioned
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://localhost:9092
+      - --pandaproxy-addr
+      - 0.0.0.0:8082
+      - --advertise-pandaproxy-addr
+      - localhost:8082
+    ports:
+      - "9092:9092"
+      - "8082:8082"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # Temporal Server (Durable workflow execution for Polecats)
+  # =============================================================================
+  temporal:
+    image: temporalio/auto-setup:latest
+    container_name: revtown-temporal
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-db
+      - DYNAMIC_CONFIG_FILE_PATH=/etc/temporal/dynamic-config.yaml
+    depends_on:
+      temporal-db:
+        condition: service_healthy
+    volumes:
+      - ./infra/temporal/dynamic-config.yaml:/etc/temporal/dynamic-config.yaml:ro
+    healthcheck:
+      test: ["CMD", "temporal", "workflow", "list", "--namespace", "default"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  temporal-db:
+    image: postgres:15
+    container_name: revtown-temporal-db
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    ports:
+      - "5433:5432"
+    volumes:
+      - temporal-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    container_name: revtown-temporal-ui
+    ports:
+      - "8088:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+
+  # =============================================================================
+  # Vault (Secrets Management)
+  # =============================================================================
+  vault:
+    image: hashicorp/vault:latest
+    container_name: revtown-vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: revtown-dev-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # RevTown API
+  # =============================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: revtown-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REVTOWN_MODE=saas
+      - REVTOWN_ENV=development
+      - DEBUG=true
+      - DOLT_HOST=dolt
+      - DOLT_PORT=3306
+      - DOLT_DATABASE=revtown
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - TEMPORAL_HOST=temporal:7233
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=revtown-dev-token
+    volumes:
+      - ./apps:/app/apps
+      - ./polecats:/app/polecats
+      - ./plugins:/app/plugins
+      - ./rigs:/app/rigs
+    depends_on:
+      dolt:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    command: uvicorn apps.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # =============================================================================
+  # RevTown Frontend (Dev Server)
+  # =============================================================================
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile.dev
+    container_name: revtown-web
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+    depends_on:
+      - api
+    command: npm run dev -- --host
+
+volumes:
+  dolt-data:
+  redpanda-data:
+  temporal-db-data:
+
+networks:
+  default:
+    name: revtown-network

@@ -1,0 +1,43 @@
+---
+# RevTown Ingress Configuration
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: revtown-ingress
+  namespace: revtown-core
+  labels:
+    app.kubernetes.io/name: revtown
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  tls:
+    - hosts:
+        - api.revtown.io
+        - app.revtown.io
+      secretName: revtown-tls
+  rules:
+    # API
+    - host: api.revtown.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: revtown-api
+                port:
+                  number: 80
+    # Frontend
+    - host: app.revtown.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: revtown-web
+                port:
+                  number: 80

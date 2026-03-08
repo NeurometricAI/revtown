@@ -1,0 +1,58 @@
+# Polecat Runner Dockerfile
+# Lightweight image for ephemeral Polecat execution
+
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Poetry
+RUN pip install poetry
+
+# Copy dependency files
+COPY pyproject.toml poetry.lock ./
+
+# Export requirements (without dev dependencies)
+RUN poetry export -f requirements.txt --output requirements.txt --without dev
+
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Production image
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Create non-root user
+RUN useradd -m -u 1000 polecat
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy application code (only what's needed for Polecats)
+COPY polecats/ ./polecats/
+COPY rigs/ ./rigs/
+COPY apps/api/core/ ./apps/api/core/
+COPY apps/api/models/ ./apps/api/models/
+COPY apps/api/config.py ./apps/api/
+
+# Set ownership
+RUN chown -R polecat:polecat /app
+
+USER polecat
+
+# Environment
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD python -c "import polecats.runner; print('ok')"
+
+# Entry point for Polecat execution
+ENTRYPOINT ["python", "-m", "polecats.runner"]

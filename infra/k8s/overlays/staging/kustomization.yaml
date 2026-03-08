@@ -1,0 +1,48 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: revtown-staging
+
+resources:
+  - ../../
+
+namePrefix: staging-
+
+commonLabels:
+  environment: staging
+
+# Staging-specific patches
+patches:
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+    target:
+      kind: Deployment
+      name: revtown-api
+  - patch: |-
+      - op: replace
+        path: /data/REVTOWN_ENV
+        value: staging
+    target:
+      kind: ConfigMap
+      name: revtown-config
+  - patch: |-
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: DEBUG
+    target:
+      kind: ConfigMap
+      name: revtown-config
+
+# Staging images
+images:
+  - name: revtown/api
+    newName: ghcr.io/revtown/api
+    newTag: main
+  - name: revtown/web
+    newName: ghcr.io/revtown/web
+    newTag: main
+  - name: revtown/polecat-runner
+    newName: ghcr.io/revtown/polecat-runner
+    newTag: main

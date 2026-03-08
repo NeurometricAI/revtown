@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: revtown-core
+
+resources:
+  - ../../
+  - hpa.yaml
+
+commonLabels:
+  environment: production
+
+# Production-specific patches
+patches:
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+    target:
+      kind: Deployment
+      name: revtown-api
+  - patch: |-
+      - op: replace
+        path: /data/REVTOWN_ENV
+        value: production
+    target:
+      kind: ConfigMap
+      name: revtown-config
+  - patch: |-
+      - op: replace
+        path: /data/DEBUG
+        value: "false"
+    target:
+      kind: ConfigMap
+      name: revtown-config
+
+# Production images with specific tags
+images:
+  - name: revtown/api
+    newName: ghcr.io/revtown/api
+  - name: revtown/web
+    newName: ghcr.io/revtown/web
+  - name: revtown/polecat-runner
+    newName: ghcr.io/revtown/polecat-runner

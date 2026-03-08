@@ -1,0 +1,49 @@
+# Temporal Dynamic Configuration for RevTown
+# This file configures runtime behavior of Temporal server
+
+# Frontend settings
+frontend.enableClientVersionCheck:
+  - value: true
+    constraints: {}
+
+# History settings
+history.defaultActivityRetryPolicy:
+  - value:
+      InitialIntervalInSeconds: 1
+      MaximumIntervalInSeconds: 100
+      BackoffCoefficient: 2.0
+      MaximumAttempts: 10
+    constraints: {}
+
+# Namespace settings
+system.enableActivityEagerExecution:
+  - value: true
+    constraints: {}
+
+# Visibility settings
+system.visibilityArchivalState:
+  - value: "enabled"
+    constraints: {}
+
+# Worker settings
+worker.enableBatcher:
+  - value: true
+    constraints: {}
+
+# Matching settings
+matching.numTaskqueueWritePartitions:
+  - value: 4
+    constraints: {}
+
+matching.numTaskqueueReadPartitions:
+  - value: 4
+    constraints: {}
+
+# Rate limiting
+frontend.rps:
+  - value: 2400
+    constraints: {}
+
+frontend.namespaceCount:
+  - value: 100
+    constraints: {}
