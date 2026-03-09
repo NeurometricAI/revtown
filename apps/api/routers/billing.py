@@ -4,12 +4,14 @@ Billing Router - Stripe integration (SaaS mode only).
 Base path: /api/v1/billing
 """
 
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel
+from sqlalchemy import text
 
 from apps.api.config import settings
 from apps.api.dependencies import AdminUser, CurrentUser, DbSession, OwnerUser
@@ -86,14 +88,30 @@ async def get_subscription(
     session: DbSession,
 ):
     """Get current subscription details."""
-    # TODO: Query from organizations table
+    query = text("""
+        SELECT plan_tier, stripe_customer_id, stripe_subscription_id
+        FROM organizations
+        WHERE id = :org_id
+    """)
+    result = await session.execute(query, {"org_id": str(user.organization_id)})
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    row_dict = dict(row._mapping)
+    plan_tier = row_dict["plan_tier"] or "free"
+    plan_info = PLAN_TIERS.get(plan_tier, PLAN_TIERS["free"])
+
     return wrap_response({
-        "plan_tier": "free",
+        "plan_tier": plan_tier,
+        "plan_name": plan_info["name"],
         "status": "active",
-        "current_period_start": datetime.utcnow().isoformat(),
-        "current_period_end": None,
+        "price_monthly": plan_info["price_monthly"],
+        "limits": plan_info["limits"],
+        "stripe_customer_id": row_dict.get("stripe_customer_id"),
+        "stripe_subscription_id": row_dict.get("stripe_subscription_id"),
         "cancel_at_period_end": False,
-        "stripe_subscription_id": None,
     })
 
 
@@ -296,14 +314,44 @@ async def get_current_usage(
     session: DbSession,
 ):
     """Get current period usage for billing."""
-    # TODO: Query usage_records table
+    # Get plan info
+    org_query = text("SELECT plan_tier FROM organizations WHERE id = :org_id")
+    org_result = await session.execute(org_query, {"org_id": str(user.organization_id)})
+    org_row = org_result.fetchone()
+    plan_tier = org_row._mapping["plan_tier"] if org_row else "free"
+    plan_info = PLAN_TIERS.get(plan_tier, PLAN_TIERS["free"])
+
+    # Calculate period start (first of current month)
+    now = datetime.utcnow()
+    period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Query usage
+    usage_query = text("""
+        SELECT COALESCE(SUM(polecat_executions), 0) as total_executions
+        FROM usage_records
+        WHERE organization_id = :org_id AND period_start >= :period_start
+    """)
+    usage_result = await session.execute(usage_query, {
+        "org_id": str(user.organization_id),
+        "period_start": period_start,
+    })
+    usage_row = usage_result.fetchone()
+    total_executions = int(usage_row._mapping["total_executions"]) if usage_row else 0
+
+    # Calculate overage
+    included = plan_info["limits"]["polecats_per_month"]
+    if isinstance(included, str):  # "unlimited"
+        overage = 0
+    else:
+        overage = max(0, total_executions - included)
 
     return wrap_response({
-        "period_start": datetime.utcnow().replace(day=1).isoformat(),
-        "polecat_executions": 0,
-        "included_in_plan": 100,
-        "overage": 0,
+        "period_start": period_start.isoformat(),
+        "polecat_executions": total_executions,
+        "included_in_plan": included,
+        "overage": overage,
         "overage_rate_cents": 5,  # $0.05 per overage execution
+        "estimated_overage_cost_cents": overage * 5,
     })
 
 
@@ -311,12 +359,44 @@ async def get_current_usage(
 async def get_usage_history(
     user: AdminUser,
     session: DbSession,
-    months: int = 6,
+    months: int = Query(6, le=24),
 ):
     """Get historical usage."""
-    # TODO: Query usage_records table
+    # Calculate start date (N months ago)
+    now = datetime.utcnow()
+    start_date = now.replace(day=1) - timedelta(days=months * 30)
 
-    return wrap_response([])
+    query = text("""
+        SELECT period_start, period_end, polecat_executions, beads_created,
+               api_calls, total_input_tokens, total_output_tokens, usage_by_rig
+        FROM usage_records
+        WHERE organization_id = :org_id AND period_start >= :start_date
+        ORDER BY period_start DESC
+    """)
+    result = await session.execute(query, {
+        "org_id": str(user.organization_id),
+        "start_date": start_date,
+    })
+
+    history = []
+    for row in result.fetchall():
+        row_dict = dict(row._mapping)
+        usage_by_rig = row_dict.get("usage_by_rig")
+        if usage_by_rig and isinstance(usage_by_rig, str):
+            usage_by_rig = json.loads(usage_by_rig)
+
+        history.append({
+            "period_start": row_dict["period_start"].isoformat() if row_dict.get("period_start") else None,
+            "period_end": row_dict["period_end"].isoformat() if row_dict.get("period_end") else None,
+            "polecat_executions": row_dict["polecat_executions"] or 0,
+            "beads_created": row_dict["beads_created"] or 0,
+            "api_calls": row_dict["api_calls"] or 0,
+            "total_input_tokens": row_dict["total_input_tokens"] or 0,
+            "total_output_tokens": row_dict["total_output_tokens"] or 0,
+            "usage_by_rig": usage_by_rig,
+        })
+
+    return wrap_response(history)
 
 
 # =============================================================================

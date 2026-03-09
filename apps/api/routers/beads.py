@@ -167,8 +167,8 @@ async def create_competitor(
     user: CurrentUser,
 ):
     """Create a new Competitor Bead."""
-    # TODO: Implement in BeadStore
-    raise NotImplementedError("Competitor beads not yet implemented")
+    competitor = await store.create_competitor(data)
+    return wrap_response(competitor.model_dump())
 
 
 @router.get("/competitors/{bead_id}", response_model=dict)
@@ -178,8 +178,38 @@ async def get_competitor(
     user: CurrentUser,
 ):
     """Get a Competitor Bead by ID."""
-    bead = await store.get_bead("competitor", bead_id)
-    return wrap_response(bead.model_dump() if hasattr(bead, "model_dump") else bead)
+    competitor = await store.get_competitor(bead_id)
+    return wrap_response(competitor.model_dump())
+
+
+@router.patch("/competitors/{bead_id}", response_model=dict)
+async def update_competitor(
+    bead_id: UUID,
+    data: CompetitorBeadUpdate,
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    expected_version: int | None = Query(None),
+):
+    """Update a Competitor Bead."""
+    competitor = await store.update_competitor(bead_id, data, expected_version)
+    return wrap_response(competitor.model_dump())
+
+
+@router.get("/competitors", response_model=dict)
+async def list_competitors(
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    campaign_id: UUID | None = None,
+    status: str | None = None,
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List Competitor Beads for the organization."""
+    competitors = await store.list_competitors(campaign_id, status, limit, offset)
+    return wrap_response(
+        [c.model_dump() for c in competitors],
+        meta={"count": len(competitors), "limit": limit, "offset": offset},
+    )
 
 
 # =============================================================================
@@ -194,8 +224,8 @@ async def create_test(
     user: CurrentUser,
 ):
     """Create a new Test Bead (A/B test)."""
-    # TODO: Implement in BeadStore
-    raise NotImplementedError("Test beads not yet implemented")
+    test = await store.create_test(data)
+    return wrap_response(test.model_dump())
 
 
 @router.get("/tests/{bead_id}", response_model=dict)
@@ -205,8 +235,39 @@ async def get_test(
     user: CurrentUser,
 ):
     """Get a Test Bead by ID."""
-    bead = await store.get_bead("test", bead_id)
-    return wrap_response(bead.model_dump() if hasattr(bead, "model_dump") else bead)
+    test = await store.get_test(bead_id)
+    return wrap_response(test.model_dump())
+
+
+@router.patch("/tests/{bead_id}", response_model=dict)
+async def update_test(
+    bead_id: UUID,
+    data: TestBeadUpdate,
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    expected_version: int | None = Query(None),
+):
+    """Update a Test Bead."""
+    test = await store.update_test(bead_id, data, expected_version)
+    return wrap_response(test.model_dump())
+
+
+@router.get("/tests", response_model=dict)
+async def list_tests(
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    campaign_id: UUID | None = None,
+    status: str | None = None,
+    test_type: str | None = None,
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List Test Beads for the organization."""
+    tests = await store.list_tests(campaign_id, status, test_type, limit, offset)
+    return wrap_response(
+        [t.model_dump() for t in tests],
+        meta={"count": len(tests), "limit": limit, "offset": offset},
+    )
 
 
 # =============================================================================
@@ -221,8 +282,8 @@ async def create_icp(
     user: CurrentUser,
 ):
     """Create a new ICP (Ideal Customer Profile) Bead."""
-    # TODO: Implement in BeadStore
-    raise NotImplementedError("ICP beads not yet implemented")
+    icp = await store.create_icp(data)
+    return wrap_response(icp.model_dump())
 
 
 @router.get("/icps/{bead_id}", response_model=dict)
@@ -232,8 +293,38 @@ async def get_icp(
     user: CurrentUser,
 ):
     """Get an ICP Bead by ID."""
-    bead = await store.get_bead("icp", bead_id)
-    return wrap_response(bead.model_dump() if hasattr(bead, "model_dump") else bead)
+    icp = await store.get_icp(bead_id)
+    return wrap_response(icp.model_dump())
+
+
+@router.patch("/icps/{bead_id}", response_model=dict)
+async def update_icp(
+    bead_id: UUID,
+    data: ICPBeadUpdate,
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    expected_version: int | None = Query(None),
+):
+    """Update an ICP Bead."""
+    icp = await store.update_icp(bead_id, data, expected_version)
+    return wrap_response(icp.model_dump())
+
+
+@router.get("/icps", response_model=dict)
+async def list_icps(
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    campaign_id: UUID | None = None,
+    is_default: bool | None = None,
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List ICP Beads for the organization."""
+    icps = await store.list_icps(campaign_id, is_default, limit, offset)
+    return wrap_response(
+        [i.model_dump() for i in icps],
+        meta={"count": len(icps), "limit": limit, "offset": offset},
+    )
 
 
 # =============================================================================
@@ -248,8 +339,8 @@ async def create_journalist(
     user: CurrentUser,
 ):
     """Create a new Journalist Bead."""
-    # TODO: Implement in BeadStore
-    raise NotImplementedError("Journalist beads not yet implemented")
+    journalist = await store.create_journalist(data)
+    return wrap_response(journalist.model_dump())
 
 
 @router.get("/journalists/{bead_id}", response_model=dict)
@@ -259,8 +350,39 @@ async def get_journalist(
     user: CurrentUser,
 ):
     """Get a Journalist Bead by ID."""
-    bead = await store.get_bead("journalist", bead_id)
-    return wrap_response(bead.model_dump() if hasattr(bead, "model_dump") else bead)
+    journalist = await store.get_journalist(bead_id)
+    return wrap_response(journalist.model_dump())
+
+
+@router.patch("/journalists/{bead_id}", response_model=dict)
+async def update_journalist(
+    bead_id: UUID,
+    data: JournalistBeadUpdate,
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    expected_version: int | None = Query(None),
+):
+    """Update a Journalist Bead."""
+    journalist = await store.update_journalist(bead_id, data, expected_version)
+    return wrap_response(journalist.model_dump())
+
+
+@router.get("/journalists", response_model=dict)
+async def list_journalists(
+    store: ScopedBeadStore,
+    user: CurrentUser,
+    publication: str | None = None,
+    publication_tier: str | None = None,
+    status: str | None = None,
+    limit: int = Query(100, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List Journalist Beads for the organization."""
+    journalists = await store.list_journalists(publication, publication_tier, status, limit, offset)
+    return wrap_response(
+        [j.model_dump() for j in journalists],
+        meta={"count": len(journalists), "limit": limit, "offset": offset},
+    )
 
 
 # =============================================================================

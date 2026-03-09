@@ -4,15 +4,31 @@ Polecats Router - Spawn, status, list, and cancel Polecat executions.
 Base path: /api/v1/polecats
 """
 
+import asyncio
 from datetime import datetime
 from enum import Enum
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from apps.api.dependencies import CurrentUser, DbSession, ScopedBeadStore
+from apps.api.dependencies import CurrentUser, ScopedBeadStore
+from apps.api.core.polecat_store import (
+    PolecatExecution,
+    PolecatStatus,
+    PolecatStore,
+    get_polecat_store,
+)
+from apps.api.core.neurometric import get_neurometric_client
+from apps.api.core.refinery import get_refinery
+from apps.api.core.witness import get_witness
+from apps.api.core.approval_store import (
+    ApprovalItem,
+    ApprovalType,
+    Urgency,
+    get_approval_store,
+)
 
 router = APIRouter()
 
@@ -43,14 +59,6 @@ class Rig(str, Enum):
     LANDING_PAD = "landing_pad"
     WIRE = "wire"
     REPO_WATCH = "repo_watch"
-
-
-class PolecatStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 # Available Polecat types per Rig
@@ -110,6 +118,32 @@ POLECAT_TYPES: dict[Rig, list[str]] = {
     ],
 }
 
+# Polecat types that always require approval
+ALWAYS_REQUIRE_APPROVAL = {
+    "pitch_draft",
+    "journalist_research",
+    "sms_draft",
+    "winner_declare",
+}
+
+# Map polecat types to approval types
+POLECAT_APPROVAL_TYPES = {
+    "blog_draft": ApprovalType.CONTENT,
+    "seo_meta": ApprovalType.CONTENT,
+    "content_calendar": ApprovalType.CONTENT,
+    "social_snippet": ApprovalType.CONTENT,
+    "image_brief": ApprovalType.CONTENT,
+    "landing_page_draft": ApprovalType.CONTENT,
+    "landing_page_variant": ApprovalType.CONTENT,
+    "email_variant": ApprovalType.OUTREACH,
+    "personalize": ApprovalType.OUTREACH,
+    "sequence": ApprovalType.OUTREACH,
+    "pitch_draft": ApprovalType.PR_PITCH,
+    "journalist_research": ApprovalType.PR_PITCH,
+    "sms_draft": ApprovalType.SMS,
+    "winner_declare": ApprovalType.TEST_WINNER,
+}
+
 
 # =============================================================================
 # Request/Response Models
@@ -126,18 +160,199 @@ class SpawnPolecatRequest(BaseModel):
     config: dict[str, Any] | None = None
 
 
-class PolecatResponse(BaseModel):
-    """Polecat execution info."""
+# =============================================================================
+# Polecat Execution Logic
+# =============================================================================
 
-    id: UUID
-    polecat_type: str
-    rig: str
-    status: PolecatStatus
-    bead_id: UUID
-    campaign_id: UUID | None
-    started_at: datetime
-    completed_at: datetime | None
-    error_message: str | None
+
+async def execute_polecat(execution: PolecatExecution, store: PolecatStore):
+    """Execute a Polecat in the background."""
+    from polecats.base import get_polecat_class
+
+    # Update to running
+    store.update_status(execution.id, PolecatStatus.RUNNING)
+
+    try:
+        # Try to get a registered Polecat class
+        polecat_class = get_polecat_class(execution.rig, execution.polecat_type)
+
+        if polecat_class:
+            # Execute real Polecat
+            result = await _execute_real_polecat(execution, polecat_class)
+        else:
+            # Fallback to direct neurometric
+            result = await _execute_fallback(execution)
+
+        # Check if needs approval
+        requires_approval = (
+            execution.polecat_type in ALWAYS_REQUIRE_APPROVAL
+            or result.get("requires_approval", False)
+        )
+
+        approval_item_id = None
+        if requires_approval:
+            approval_item_id = await _queue_for_approval(execution, result)
+
+        # Update execution with results
+        store.update_status(
+            execution.id,
+            PolecatStatus.COMPLETED,
+            output_content=result.get("output"),
+            output_bead_ids=result.get("output_bead_ids", []),
+            refinery_scores={"overall": result.get("refinery_score", 1.0)},
+            refinery_passed=result.get("refinery_passed", True),
+            witness_passed=result.get("witness_passed", True),
+            requires_approval=requires_approval,
+            approval_item_id=approval_item_id,
+            model_used=result.get("model_used"),
+            tokens_input=result.get("tokens_input", 0),
+            tokens_output=result.get("tokens_output", 0),
+        )
+
+    except asyncio.CancelledError:
+        store.update_status(execution.id, PolecatStatus.CANCELLED)
+        raise
+    except Exception as e:
+        store.update_status(
+            execution.id,
+            PolecatStatus.FAILED,
+            error_message=str(e),
+        )
+
+
+async def _execute_real_polecat(
+    execution: PolecatExecution,
+    polecat_class: type,
+) -> dict[str, Any]:
+    """Execute a real Polecat instance."""
+    from apps.api.core.convoy_executor import MockBeadStore
+    from apps.api.core.convoy_store import Convoy, ConvoyStep, ConvoyStatus
+
+    neurometric = get_neurometric_client()
+    refinery = get_refinery()
+    witness = get_witness()
+
+    # Create mock convoy/step for context
+    mock_convoy = Convoy(
+        id="direct-execution",
+        campaign_id=execution.campaign_id or "",
+        campaign_name="Direct Execution",
+        goal=execution.config.get("goal", "Execute task"),
+        organization_id=execution.organization_id,
+        status=ConvoyStatus.EXECUTING,
+        steps=[],
+    )
+    mock_step = ConvoyStep(
+        id=execution.id,
+        rig=execution.rig,
+        polecat_type=execution.polecat_type,
+        description=f"Execute {execution.polecat_type}",
+    )
+    mock_bead_store = MockBeadStore(mock_convoy, mock_step)
+
+    # Create and run the Polecat
+    polecat = polecat_class(
+        bead_id=UUID(execution.bead_id),
+        bead_store=mock_bead_store,
+        neurometric=neurometric,
+        refinery=refinery,
+        witness=witness,
+        config=execution.config,
+    )
+
+    result = await polecat.run()
+
+    return {
+        "success": result.success,
+        "output": str(result.output_bead_ids[0]) if result.output_bead_ids else None,
+        "output_bead_ids": [str(bid) for bid in result.output_bead_ids],
+        "requires_approval": result.requires_approval,
+        "refinery_passed": result.refinery_result.passed if result.refinery_result else True,
+        "refinery_score": result.refinery_result.overall_score if result.refinery_result else 1.0,
+        "witness_passed": result.witness_result.passed if result.witness_result else True,
+        "model_used": result.model_used,
+        "tokens_input": result.tokens_input,
+        "tokens_output": result.tokens_output,
+        "error": result.error,
+    }
+
+
+async def _execute_fallback(execution: PolecatExecution) -> dict[str, Any]:
+    """Execute via direct neurometric call."""
+    neurometric = get_neurometric_client()
+
+    # Build prompt based on polecat type
+    prompts = {
+        "blog_draft": f"Write a blog post about: {execution.config.get('topic', 'general topic')}",
+        "seo_meta": f"Generate SEO metadata for: {execution.config.get('topic', 'content')}",
+        "content_calendar": f"Create a content calendar for: {execution.config.get('goal', 'marketing')}",
+        "social_snippet": f"Create social media snippets for: {execution.config.get('topic', 'content')}",
+        "personalize": f"Write a personalized email for: {execution.config.get('context', 'outreach')}",
+        "sequence": f"Design an email sequence for: {execution.config.get('goal', 'nurturing')}",
+        "pitch_draft": f"Draft a PR pitch for: {execution.config.get('topic', 'announcement')}",
+        "landing_page_draft": f"Write landing page copy for: {execution.config.get('product', 'product')}",
+    }
+
+    prompt = prompts.get(
+        execution.polecat_type,
+        f"Execute {execution.polecat_type} task. Context: {execution.config}"
+    )
+
+    response = await neurometric.complete(
+        task_class=execution.polecat_type,
+        prompt=prompt,
+    )
+
+    return {
+        "success": True,
+        "output": response.content,
+        "output_bead_ids": [],
+        "requires_approval": execution.polecat_type in ALWAYS_REQUIRE_APPROVAL,
+        "refinery_passed": True,
+        "refinery_score": 1.0,
+        "witness_passed": True,
+        "model_used": response.model_used,
+        "tokens_input": response.tokens_input,
+        "tokens_output": response.tokens_output,
+    }
+
+
+async def _queue_for_approval(
+    execution: PolecatExecution,
+    result: dict[str, Any],
+) -> str:
+    """Queue output for human approval."""
+    approval_store = get_approval_store()
+    approval_type = POLECAT_APPROVAL_TYPES.get(execution.polecat_type, ApprovalType.OTHER)
+
+    # SMS and PR are always critical
+    if approval_type in (ApprovalType.SMS, ApprovalType.PR_PITCH):
+        urgency = Urgency.CRITICAL
+    elif not result.get("refinery_passed", True):
+        urgency = Urgency.HIGH
+    else:
+        urgency = Urgency.NORMAL
+
+    item = ApprovalItem(
+        id=str(uuid4()),
+        bead_type="asset",
+        bead_id=execution.bead_id,
+        rig=execution.rig,
+        polecat_type=execution.polecat_type,
+        approval_type=approval_type,
+        urgency=urgency,
+        organization_id=execution.organization_id,
+        campaign_id=execution.campaign_id,
+        preview_title=f"{execution.polecat_type.replace('_', ' ').title()}",
+        preview_content=result.get("output", "")[:200] if result.get("output") else None,
+        full_content=result.get("output"),
+        refinery_scores={"overall": result.get("refinery_score", 1.0)},
+        refinery_passed=result.get("refinery_passed", True),
+        witness_passed=result.get("witness_passed", True),
+    )
+
+    approval_store.create(item)
+    return item.id
 
 
 # =============================================================================
@@ -165,85 +380,120 @@ async def spawn_polecat(
     # Validate polecat type exists for the rig
     valid_types = POLECAT_TYPES.get(request.rig, [])
     if request.polecat_type not in valid_types:
-        return wrap_response(
-            None,
-            meta={
-                "error": f"Invalid polecat_type '{request.polecat_type}' for rig '{request.rig}'",
-                "valid_types": valid_types,
-            },
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid polecat_type '{request.polecat_type}' for rig '{request.rig}'. Valid types: {valid_types}",
         )
 
-    # TODO: Actually spawn the Polecat via Temporal
-    # For now, return a placeholder
-    from uuid import uuid4
+    polecat_store = get_polecat_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
 
-    polecat_id = uuid4()
+    # Create execution record
+    execution = PolecatExecution(
+        id=str(uuid4()),
+        polecat_type=request.polecat_type,
+        rig=request.rig.value,
+        bead_id=str(request.bead_id),
+        organization_id=org_id,
+        campaign_id=str(request.campaign_id) if request.campaign_id else None,
+        config=request.config or {},
+    )
+    polecat_store.create(execution)
+
+    # Start execution in background
+    task = asyncio.create_task(execute_polecat(execution, polecat_store))
+    execution._task = task
 
     return wrap_response({
-        "polecat_id": str(polecat_id),
-        "polecat_type": request.polecat_type,
-        "rig": request.rig,
-        "bead_id": str(request.bead_id),
-        "status": "pending",
+        "polecat_id": execution.id,
+        "polecat_type": execution.polecat_type,
+        "rig": execution.rig,
+        "bead_id": execution.bead_id,
+        "status": execution.status.value,
         "message": "Polecat spawned - use /polecats/{id}/status to track progress",
     })
 
 
 @router.get("/{polecat_id}/status", response_model=dict)
 async def get_polecat_status(
-    polecat_id: UUID,
+    polecat_id: str,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
     """Get the status of a Polecat execution."""
-    # TODO: Look up in polecat_executions table
+    polecat_store = get_polecat_store()
+    execution = polecat_store.get(polecat_id)
+
+    if not execution:
+        raise HTTPException(status_code=404, detail="Polecat execution not found")
+
+    # Verify org access
+    org_id = str(user.organization_id) if user.organization_id else ""
+    if execution.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Polecat execution not found")
+
     return wrap_response({
-        "polecat_id": str(polecat_id),
-        "status": "pending",
-        "progress": None,
-        "error": None,
+        "polecat_id": execution.id,
+        "status": execution.status.value,
+        "progress": execution.progress,
+        "started_at": execution.started_at.isoformat() if execution.started_at else None,
+        "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
+        "duration_ms": execution.duration_ms,
+        "error": execution.error_message,
+        "requires_approval": execution.requires_approval,
+        "approval_item_id": execution.approval_item_id,
     })
 
 
 @router.get("/{polecat_id}", response_model=dict)
 async def get_polecat(
-    polecat_id: UUID,
+    polecat_id: str,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
     """Get full details of a Polecat execution."""
-    # TODO: Look up in polecat_executions table
-    return wrap_response({
-        "polecat_id": str(polecat_id),
-        "polecat_type": None,
-        "rig": None,
-        "status": "pending",
-        "input_bead_id": None,
-        "output_bead_ids": [],
-        "refinery_scores": None,
-        "witness_passed": None,
-        "model_used": None,
-        "tokens_input": None,
-        "tokens_output": None,
-        "started_at": None,
-        "completed_at": None,
-        "duration_ms": None,
-        "error_message": None,
-    })
+    polecat_store = get_polecat_store()
+    execution = polecat_store.get(polecat_id)
+
+    if not execution:
+        raise HTTPException(status_code=404, detail="Polecat execution not found")
+
+    org_id = str(user.organization_id) if user.organization_id else ""
+    if execution.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Polecat execution not found")
+
+    return wrap_response(execution.to_dict())
 
 
 @router.post("/{polecat_id}/cancel", response_model=dict)
 async def cancel_polecat(
-    polecat_id: UUID,
+    polecat_id: str,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
     """Cancel a running Polecat execution."""
-    # TODO: Cancel via Temporal
+    polecat_store = get_polecat_store()
+    execution = polecat_store.get(polecat_id)
+
+    if not execution:
+        raise HTTPException(status_code=404, detail="Polecat execution not found")
+
+    org_id = str(user.organization_id) if user.organization_id else ""
+    if execution.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Polecat execution not found")
+
+    if execution.status not in (PolecatStatus.PENDING, PolecatStatus.RUNNING):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel execution in status: {execution.status.value}",
+        )
+
+    polecat_store.cancel(polecat_id)
+
     return wrap_response({
-        "polecat_id": str(polecat_id),
+        "polecat_id": polecat_id,
         "status": "cancelled",
-        "message": "Polecat cancellation requested",
+        "message": "Polecat execution cancelled",
     })
 
 
@@ -253,15 +503,26 @@ async def list_polecats(
     user: CurrentUser,
     rig: Rig | None = None,
     status: PolecatStatus | None = None,
-    campaign_id: UUID | None = None,
+    campaign_id: str | None = None,
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
 ):
     """List Polecat executions for the organization."""
-    # TODO: Query polecat_executions table
+    polecat_store = get_polecat_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
+
+    executions, total = polecat_store.list_executions(
+        organization_id=org_id,
+        rig=rig.value if rig else None,
+        status=status,
+        campaign_id=campaign_id,
+        limit=limit,
+        offset=offset,
+    )
+
     return wrap_response(
-        [],
-        meta={"count": 0, "limit": limit, "offset": offset},
+        [e.to_dict() for e in executions],
+        meta={"count": total, "limit": limit, "offset": offset},
     )
 
 

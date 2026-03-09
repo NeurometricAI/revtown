@@ -609,6 +609,28 @@ CREATE TABLE IF NOT EXISTS usage_records (
 );
 
 -- =============================================================================
+-- Invitations
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS invitations (
+    id VARCHAR(36) PRIMARY KEY,
+    organization_id VARCHAR(36) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    role ENUM('owner', 'admin', 'member') NOT NULL DEFAULT 'member',
+    token VARCHAR(255) NOT NULL,
+    invited_by VARCHAR(36),
+    status ENUM('pending', 'accepted', 'cancelled', 'expired') NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP,
+
+    FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
+    FOREIGN KEY (invited_by) REFERENCES users(id),
+    UNIQUE KEY unique_invite_token (token),
+    INDEX idx_invite_org (organization_id),
+    INDEX idx_invite_email (email),
+    INDEX idx_invite_status (status)
+);
+
+-- =============================================================================
 -- Audit Log
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -642,3 +664,18 @@ INSERT INTO model_registry_beads (id, task_class, default_model, evaluation_stat
 ('00000000-0000-0000-0000-000000000004', 'subject_line_ab', 'claude-haiku-4-5-20251001', 'confirmed_optimal'),
 ('00000000-0000-0000-0000-000000000005', 'pr_pitch_draft', 'claude-sonnet-4-5-20250929', 'confirmed_optimal'),
 ('00000000-0000-0000-0000-000000000006', 'statistical_significance', 'claude-sonnet-4-5-20250929', 'confirmed_optimal');
+
+-- =============================================================================
+-- Default Organization for Self-Hosted Mode
+-- =============================================================================
+INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at) VALUES
+('00000000-0000-0000-0000-000000000001', 'Default Organization', 'default', 'scale', NOW(), NOW())
+ON DUPLICATE KEY UPDATE name = name;
+
+-- =============================================================================
+-- Create Remote Access User
+-- =============================================================================
+-- Note: This allows connections from any host (for Docker networking)
+CREATE USER IF NOT EXISTS 'revtown'@'%' IDENTIFIED BY 'revtown';
+GRANT ALL PRIVILEGES ON revtown.* TO 'revtown'@'%';
+FLUSH PRIVILEGES;

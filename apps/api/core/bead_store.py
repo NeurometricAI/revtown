@@ -504,6 +504,560 @@ class BeadStore:
         return await self.get_asset(bead_id)
 
     # =========================================================================
+    # Competitor Beads
+    # =========================================================================
+
+    async def create_competitor(self, data: CompetitorBeadCreate) -> CompetitorBead:
+        """Create a new Competitor Bead."""
+        if not self.organization_id:
+            raise BeadStoreError("Organization ID is required")
+
+        bead_id = uuid4()
+        now = datetime.utcnow()
+
+        params = self._serialize_json_fields({
+            "id": str(bead_id),
+            "type": "competitor",
+            "organization_id": str(self.organization_id),
+            "campaign_id": str(data.campaign_id) if data.campaign_id else None,
+            "name": data.name,
+            "domain": data.domain,
+            "description": data.description,
+            "monitor_website": data.monitor_website,
+            "monitor_social": data.monitor_social,
+            "monitor_jobs": data.monitor_jobs,
+            "monitor_reviews": data.monitor_reviews,
+            "monitor_pr": data.monitor_pr,
+            "alert_threshold": data.alert_threshold.value if data.alert_threshold else "high",
+            "status": "active",
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+        })
+
+        columns = ", ".join(params.keys())
+        placeholders = ", ".join(f":{k}" for k in params.keys())
+
+        query = f"INSERT INTO competitor_beads ({columns}) VALUES ({placeholders})"
+
+        await self._execute(query, params)
+        await self.session.commit()
+
+        self.logger.info("Competitor bead created", bead_id=str(bead_id), name=data.name)
+        return await self.get_competitor(bead_id)
+
+    async def get_competitor(self, bead_id: UUID) -> CompetitorBead:
+        """Get a Competitor Bead by ID."""
+        query = """
+            SELECT * FROM competitor_beads
+            WHERE id = :id AND organization_id = :org_id
+        """
+        row = await self._fetch_one(query, {"id": str(bead_id), "org_id": str(self.organization_id)})
+
+        if not row:
+            raise BeadNotFoundError(f"Competitor bead {bead_id} not found")
+
+        row = self._deserialize_json_fields(row, ["latest_changes", "job_postings", "social_activity", "review_summary", "pr_mentions"])
+        return CompetitorBead(**row)
+
+    async def update_competitor(
+        self, bead_id: UUID, data: CompetitorBeadUpdate, expected_version: int | None = None
+    ) -> CompetitorBead:
+        """Update a Competitor Bead."""
+        current = await self.get_competitor(bead_id)
+
+        if expected_version and current.version != expected_version:
+            raise BeadVersionConflictError(
+                f"Version conflict: expected {expected_version}, found {current.version}"
+            )
+
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            return current
+
+        params = {"id": str(bead_id), "org_id": str(self.organization_id)}
+        update_fields = []
+
+        for key, value in update_data.items():
+            if key == "alert_threshold" and value is not None:
+                params[key] = value.value if hasattr(value, 'value') else value
+            elif key == "status" and value is not None:
+                params[key] = value.value if hasattr(value, 'value') else value
+            else:
+                serialized = self._serialize_json_fields({key: value})[key]
+                params[key] = serialized
+            update_fields.append(f"{key} = :{key}")
+
+        params["new_version"] = current.version + 1
+        update_fields.append("version = :new_version")
+        update_fields.append("updated_at = NOW()")
+
+        query = f"""
+            UPDATE competitor_beads
+            SET {", ".join(update_fields)}
+            WHERE id = :id AND organization_id = :org_id
+        """
+
+        await self._execute(query, params)
+        await self.session.commit()
+
+        return await self.get_competitor(bead_id)
+
+    async def list_competitors(
+        self,
+        campaign_id: UUID | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[CompetitorBead]:
+        """List Competitor Beads for the organization."""
+        params: dict[str, Any] = {
+            "org_id": str(self.organization_id),
+            "limit": limit,
+            "offset": offset,
+        }
+
+        where_clauses = ["organization_id = :org_id"]
+        if campaign_id:
+            where_clauses.append("campaign_id = :campaign_id")
+            params["campaign_id"] = str(campaign_id)
+        if status:
+            where_clauses.append("status = :status")
+            params["status"] = status
+
+        query = f"""
+            SELECT * FROM competitor_beads
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """
+
+        rows = await self._fetch_all(query, params)
+        return [
+            CompetitorBead(**self._deserialize_json_fields(row, ["latest_changes", "job_postings", "social_activity", "review_summary", "pr_mentions"]))
+            for row in rows
+        ]
+
+    # =========================================================================
+    # Test Beads
+    # =========================================================================
+
+    async def create_test(self, data: TestBeadCreate) -> TestBead:
+        """Create a new Test Bead."""
+        if not self.organization_id:
+            raise BeadStoreError("Organization ID is required")
+
+        bead_id = uuid4()
+        now = datetime.utcnow()
+
+        params = self._serialize_json_fields({
+            "id": str(bead_id),
+            "type": "test",
+            "organization_id": str(self.organization_id),
+            "campaign_id": str(data.campaign_id) if data.campaign_id else None,
+            "name": data.name,
+            "test_type": data.test_type.value,
+            "hypothesis": data.hypothesis,
+            "control_asset_id": str(data.control_asset_id) if data.control_asset_id else None,
+            "variant_asset_ids": [str(v) for v in data.variant_asset_ids] if data.variant_asset_ids else None,
+            "traffic_split": data.traffic_split,
+            "min_sample_size": data.min_sample_size,
+            "max_duration_days": data.max_duration_days,
+            "status": "draft",
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+        })
+
+        columns = ", ".join(params.keys())
+        placeholders = ", ".join(f":{k}" for k in params.keys())
+
+        query = f"INSERT INTO test_beads ({columns}) VALUES ({placeholders})"
+
+        await self._execute(query, params)
+        await self.session.commit()
+
+        self.logger.info("Test bead created", bead_id=str(bead_id), name=data.name)
+        return await self.get_test(bead_id)
+
+    async def get_test(self, bead_id: UUID) -> TestBead:
+        """Get a Test Bead by ID."""
+        query = """
+            SELECT * FROM test_beads
+            WHERE id = :id AND organization_id = :org_id
+        """
+        row = await self._fetch_one(query, {"id": str(bead_id), "org_id": str(self.organization_id)})
+
+        if not row:
+            raise BeadNotFoundError(f"Test bead {bead_id} not found")
+
+        row = self._deserialize_json_fields(row, ["variant_asset_ids", "traffic_split", "metrics"])
+        return TestBead(**row)
+
+    async def update_test(
+        self, bead_id: UUID, data: TestBeadUpdate, expected_version: int | None = None
+    ) -> TestBead:
+        """Update a Test Bead."""
+        current = await self.get_test(bead_id)
+
+        if expected_version and current.version != expected_version:
+            raise BeadVersionConflictError(
+                f"Version conflict: expected {expected_version}, found {current.version}"
+            )
+
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            return current
+
+        params = {"id": str(bead_id), "org_id": str(self.organization_id)}
+        update_fields = []
+
+        for key, value in update_data.items():
+            if key == "status" and value is not None:
+                params[key] = value.value if hasattr(value, 'value') else value
+            elif key == "control_asset_id" and value is not None:
+                params[key] = str(value)
+            elif key == "variant_asset_ids" and value is not None:
+                params[key] = json.dumps([str(v) for v in value])
+            else:
+                serialized = self._serialize_json_fields({key: value})[key]
+                params[key] = serialized
+            update_fields.append(f"{key} = :{key}")
+
+        params["new_version"] = current.version + 1
+        update_fields.append("version = :new_version")
+        update_fields.append("updated_at = NOW()")
+
+        query = f"""
+            UPDATE test_beads
+            SET {", ".join(update_fields)}
+            WHERE id = :id AND organization_id = :org_id
+        """
+
+        await self._execute(query, params)
+        await self.session.commit()
+
+        return await self.get_test(bead_id)
+
+    async def list_tests(
+        self,
+        campaign_id: UUID | None = None,
+        status: str | None = None,
+        test_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[TestBead]:
+        """List Test Beads for the organization."""
+        params: dict[str, Any] = {
+            "org_id": str(self.organization_id),
+            "limit": limit,
+            "offset": offset,
+        }
+
+        where_clauses = ["organization_id = :org_id"]
+        if campaign_id:
+            where_clauses.append("campaign_id = :campaign_id")
+            params["campaign_id"] = str(campaign_id)
+        if status:
+            where_clauses.append("status = :status")
+            params["status"] = status
+        if test_type:
+            where_clauses.append("test_type = :test_type")
+            params["test_type"] = test_type
+
+        query = f"""
+            SELECT * FROM test_beads
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """
+
+        rows = await self._fetch_all(query, params)
+        return [
+            TestBead(**self._deserialize_json_fields(row, ["variant_asset_ids", "traffic_split", "metrics"]))
+            for row in rows
+        ]
+
+    # =========================================================================
+    # ICP Beads
+    # =========================================================================
+
+    async def create_icp(self, data: ICPBeadCreate) -> ICPBead:
+        """Create a new ICP Bead."""
+        if not self.organization_id:
+            raise BeadStoreError("Organization ID is required")
+
+        bead_id = uuid4()
+        now = datetime.utcnow()
+
+        params = self._serialize_json_fields({
+            "id": str(bead_id),
+            "type": "icp",
+            "organization_id": str(self.organization_id),
+            "campaign_id": str(data.campaign_id) if data.campaign_id else None,
+            "name": data.name,
+            "description": data.description,
+            "company_sizes": data.company_sizes,
+            "industries": data.industries,
+            "revenue_ranges": data.revenue_ranges,
+            "geographies": data.geographies,
+            "job_titles": data.job_titles,
+            "departments": data.departments,
+            "seniority_levels": data.seniority_levels,
+            "technologies": data.technologies,
+            "buying_signals": data.buying_signals,
+            "pain_points": data.pain_points,
+            "scoring_weights": data.scoring_weights,
+            "is_default": data.is_default,
+            "status": "active",
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+        })
+
+        columns = ", ".join(params.keys())
+        placeholders = ", ".join(f":{k}" for k in params.keys())
+
+        query = f"INSERT INTO icp_beads ({columns}) VALUES ({placeholders})"
+
+        await self._execute(query, params)
+        await self.session.commit()
+
+        self.logger.info("ICP bead created", bead_id=str(bead_id), name=data.name)
+        return await self.get_icp(bead_id)
+
+    async def get_icp(self, bead_id: UUID) -> ICPBead:
+        """Get an ICP Bead by ID."""
+        query = """
+            SELECT * FROM icp_beads
+            WHERE id = :id AND organization_id = :org_id
+        """
+        row = await self._fetch_one(query, {"id": str(bead_id), "org_id": str(self.organization_id)})
+
+        if not row:
+            raise BeadNotFoundError(f"ICP bead {bead_id} not found")
+
+        json_fields = ["company_sizes", "industries", "revenue_ranges", "geographies", "job_titles",
+                       "departments", "seniority_levels", "technologies", "buying_signals",
+                       "pain_points", "scoring_weights"]
+        row = self._deserialize_json_fields(row, json_fields)
+        return ICPBead(**row)
+
+    async def update_icp(
+        self, bead_id: UUID, data: ICPBeadUpdate, expected_version: int | None = None
+    ) -> ICPBead:
+        """Update an ICP Bead."""
+        current = await self.get_icp(bead_id)
+
+        if expected_version and current.version != expected_version:
+            raise BeadVersionConflictError(
+                f"Version conflict: expected {expected_version}, found {current.version}"
+            )
+
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            return current
+
+        params = {"id": str(bead_id), "org_id": str(self.organization_id)}
+        update_fields = []
+
+        for key, value in update_data.items():
+            if key == "status" and value is not None:
+                params[key] = value.value if hasattr(value, 'value') else value
+            else:
+                serialized = self._serialize_json_fields({key: value})[key]
+                params[key] = serialized
+            update_fields.append(f"{key} = :{key}")
+
+        params["new_version"] = current.version + 1
+        update_fields.append("version = :new_version")
+        update_fields.append("updated_at = NOW()")
+
+        query = f"""
+            UPDATE icp_beads
+            SET {", ".join(update_fields)}
+            WHERE id = :id AND organization_id = :org_id
+        """
+
+        await self._execute(query, params)
+        await self.session.commit()
+
+        return await self.get_icp(bead_id)
+
+    async def list_icps(
+        self,
+        campaign_id: UUID | None = None,
+        is_default: bool | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[ICPBead]:
+        """List ICP Beads for the organization."""
+        params: dict[str, Any] = {
+            "org_id": str(self.organization_id),
+            "limit": limit,
+            "offset": offset,
+        }
+
+        where_clauses = ["organization_id = :org_id"]
+        if campaign_id:
+            where_clauses.append("campaign_id = :campaign_id")
+            params["campaign_id"] = str(campaign_id)
+        if is_default is not None:
+            where_clauses.append("is_default = :is_default")
+            params["is_default"] = is_default
+
+        query = f"""
+            SELECT * FROM icp_beads
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """
+
+        json_fields = ["company_sizes", "industries", "revenue_ranges", "geographies", "job_titles",
+                       "departments", "seniority_levels", "technologies", "buying_signals",
+                       "pain_points", "scoring_weights"]
+        rows = await self._fetch_all(query, params)
+        return [ICPBead(**self._deserialize_json_fields(row, json_fields)) for row in rows]
+
+    # =========================================================================
+    # Journalist Beads
+    # =========================================================================
+
+    async def create_journalist(self, data: JournalistBeadCreate) -> JournalistBead:
+        """Create a new Journalist Bead."""
+        if not self.organization_id:
+            raise BeadStoreError("Organization ID is required")
+
+        bead_id = uuid4()
+        now = datetime.utcnow()
+
+        params = self._serialize_json_fields({
+            "id": str(bead_id),
+            "type": "journalist",
+            "organization_id": str(self.organization_id),
+            "campaign_id": str(data.campaign_id) if data.campaign_id else None,
+            "name": data.name,
+            "email": data.email,
+            "phone": data.phone,
+            "publication": data.publication,
+            "publication_tier": data.publication_tier.value if data.publication_tier else "tier2",
+            "beats": data.beats,
+            "twitter_handle": data.twitter_handle,
+            "linkedin_url": data.linkedin_url,
+            "preferred_contact_method": data.preferred_contact_method.value if data.preferred_contact_method else "email",
+            "notes": data.notes,
+            "status": "active",
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+        })
+
+        columns = ", ".join(params.keys())
+        placeholders = ", ".join(f":{k}" for k in params.keys())
+
+        query = f"INSERT INTO journalist_beads ({columns}) VALUES ({placeholders})"
+
+        await self._execute(query, params)
+        await self.session.commit()
+
+        self.logger.info("Journalist bead created", bead_id=str(bead_id), name=data.name)
+        return await self.get_journalist(bead_id)
+
+    async def get_journalist(self, bead_id: UUID) -> JournalistBead:
+        """Get a Journalist Bead by ID."""
+        query = """
+            SELECT * FROM journalist_beads
+            WHERE id = :id AND organization_id = :org_id
+        """
+        row = await self._fetch_one(query, {"id": str(bead_id), "org_id": str(self.organization_id)})
+
+        if not row:
+            raise BeadNotFoundError(f"Journalist bead {bead_id} not found")
+
+        row = self._deserialize_json_fields(row, ["beats", "pitch_history", "coverage_history", "embargo_history"])
+        return JournalistBead(**row)
+
+    async def update_journalist(
+        self, bead_id: UUID, data: JournalistBeadUpdate, expected_version: int | None = None
+    ) -> JournalistBead:
+        """Update a Journalist Bead."""
+        current = await self.get_journalist(bead_id)
+
+        if expected_version and current.version != expected_version:
+            raise BeadVersionConflictError(
+                f"Version conflict: expected {expected_version}, found {current.version}"
+            )
+
+        update_data = data.model_dump(exclude_unset=True)
+        if not update_data:
+            return current
+
+        params = {"id": str(bead_id), "org_id": str(self.organization_id)}
+        update_fields = []
+
+        for key, value in update_data.items():
+            if key in ("status", "publication_tier", "preferred_contact_method") and value is not None:
+                params[key] = value.value if hasattr(value, 'value') else value
+            else:
+                serialized = self._serialize_json_fields({key: value})[key]
+                params[key] = serialized
+            update_fields.append(f"{key} = :{key}")
+
+        params["new_version"] = current.version + 1
+        update_fields.append("version = :new_version")
+        update_fields.append("updated_at = NOW()")
+
+        query = f"""
+            UPDATE journalist_beads
+            SET {", ".join(update_fields)}
+            WHERE id = :id AND organization_id = :org_id
+        """
+
+        await self._execute(query, params)
+        await self.session.commit()
+
+        return await self.get_journalist(bead_id)
+
+    async def list_journalists(
+        self,
+        publication: str | None = None,
+        publication_tier: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[JournalistBead]:
+        """List Journalist Beads for the organization."""
+        params: dict[str, Any] = {
+            "org_id": str(self.organization_id),
+            "limit": limit,
+            "offset": offset,
+        }
+
+        where_clauses = ["organization_id = :org_id"]
+        if publication:
+            where_clauses.append("publication = :publication")
+            params["publication"] = publication
+        if publication_tier:
+            where_clauses.append("publication_tier = :publication_tier")
+            params["publication_tier"] = publication_tier
+        if status:
+            where_clauses.append("status = :status")
+            params["status"] = status
+
+        query = f"""
+            SELECT * FROM journalist_beads
+            WHERE {" AND ".join(where_clauses)}
+            ORDER BY relationship_score DESC, created_at DESC
+            LIMIT :limit OFFSET :offset
+        """
+
+        rows = await self._fetch_all(query, params)
+        return [
+            JournalistBead(**self._deserialize_json_fields(row, ["beats", "pitch_history", "coverage_history", "embargo_history"]))
+            for row in rows
+        ]
+
+    # =========================================================================
     # History & Revert (Dolt-specific)
     # =========================================================================
 
@@ -614,34 +1168,41 @@ class BeadStore:
 
     async def get_bead(self, bead_type: str, bead_id: UUID) -> BeadBase:
         """Get any Bead by type and ID."""
-        if bead_type == "campaign":
-            return await self.get_campaign(bead_id)
-        elif bead_type == "lead":
-            return await self.get_lead(bead_id)
-        elif bead_type == "asset":
-            return await self.get_asset(bead_id)
-        else:
-            # Generic fetch for other types
-            table_name = BEAD_TABLE_MAP.get(bead_type)
-            if not table_name:
-                raise BeadStoreError(f"Unknown bead type: {bead_type}")
+        type_handlers = {
+            "campaign": self.get_campaign,
+            "lead": self.get_lead,
+            "asset": self.get_asset,
+            "competitor": self.get_competitor,
+            "test": self.get_test,
+            "icp": self.get_icp,
+            "journalist": self.get_journalist,
+        }
 
-            query = f"""
-                SELECT * FROM {table_name}
-                WHERE id = :id AND organization_id = :org_id
-            """
-            row = await self._fetch_one(
-                query, {"id": str(bead_id), "org_id": str(self.organization_id)}
-            )
+        handler = type_handlers.get(bead_type)
+        if handler:
+            return await handler(bead_id)
 
-            if not row:
-                raise BeadNotFoundError(f"{bead_type} bead {bead_id} not found")
+        # Generic fetch for other types (model_registry, plugin)
+        table_name = BEAD_TABLE_MAP.get(bead_type)
+        if not table_name:
+            raise BeadStoreError(f"Unknown bead type: {bead_type}")
 
-            model_class = BEAD_TYPE_MAP.get(bead_type)
-            if model_class:
-                return model_class(**row)
+        query = f"""
+            SELECT * FROM {table_name}
+            WHERE id = :id AND organization_id = :org_id
+        """
+        row = await self._fetch_one(
+            query, {"id": str(bead_id), "org_id": str(self.organization_id)}
+        )
 
-            return row
+        if not row:
+            raise BeadNotFoundError(f"{bead_type} bead {bead_id} not found")
+
+        model_class = BEAD_TYPE_MAP.get(bead_type)
+        if model_class:
+            return model_class(**row)
+
+        return row
 
     async def archive_bead(self, bead_type: str, bead_id: UUID) -> bool:
         """

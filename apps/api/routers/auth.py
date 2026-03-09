@@ -8,20 +8,18 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from jose import jwt
-from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import text
 
 from apps.api.config import settings
 from apps.api.dependencies import CurrentUser, DbSession, OptionalUser
 from apps.api.middleware.error_handler import AuthenticationError
 
 router = APIRouter()
-
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def wrap_response(data: Any, meta: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -59,12 +57,16 @@ def create_refresh_token(data: dict) -> str:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash."""
-    return pwd_context.verify(plain_password, hashed_password)
+    return bcrypt.checkpw(
+        plain_password.encode('utf-8'),
+        hashed_password.encode('utf-8')
+    )
 
 
 def hash_password(password: str) -> str:
     """Hash a password."""
-    return pwd_context.hash(password)
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
 
 # =============================================================================
@@ -139,13 +141,55 @@ async def signup(
     If organization_name is provided, a new organization is created.
     Otherwise, the user will need to join an existing organization.
     """
-    # TODO: Check if email already exists
-    # TODO: Create user in database
-    # TODO: Create organization if name provided
-    # TODO: Send verification email
+    # Check if email already exists
+    check_query = text("SELECT id FROM users WHERE email = :email")
+    existing = await session.execute(check_query, {"email": data.email})
+    if existing.fetchone():
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     user_id = uuid4()
     org_id = uuid4() if data.organization_name else None
+    password_hash = hash_password(data.password)
+
+    # Create user
+    user_query = text("""
+        INSERT INTO users (id, email, password_hash, name, email_verified, is_active, created_at, updated_at)
+        VALUES (:id, :email, :password_hash, :name, 0, 1, NOW(), NOW())
+    """)
+    await session.execute(user_query, {
+        "id": str(user_id),
+        "email": data.email,
+        "password_hash": password_hash,
+        "name": data.name,
+    })
+
+    # Create organization if name provided
+    if org_id and data.organization_name:
+        # Create slug from name
+        slug = data.organization_name.lower().replace(" ", "-")[:100]
+
+        org_query = text("""
+            INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+            VALUES (:id, :name, :slug, 'free', NOW(), NOW())
+        """)
+        await session.execute(org_query, {
+            "id": str(org_id),
+            "name": data.organization_name,
+            "slug": slug,
+        })
+
+        # Add user as owner
+        member_query = text("""
+            INSERT INTO org_members (id, organization_id, user_id, role, joined_at)
+            VALUES (:id, :org_id, :user_id, 'owner', NOW())
+        """)
+        await session.execute(member_query, {
+            "id": str(uuid4()),
+            "org_id": str(org_id),
+            "user_id": str(user_id),
+        })
+
+    await session.commit()
 
     access_token = create_access_token({
         "sub": str(user_id),
@@ -185,12 +229,73 @@ async def login(
 
     Returns access and refresh tokens.
     """
-    # TODO: Look up user by email
-    # TODO: Verify password
-    # TODO: Get user's organization(s)
+    # Look up user by email
+    user_query = text("""
+        SELECT id, email, password_hash, name, is_active
+        FROM users
+        WHERE email = :email
+    """)
+    result = await session.execute(user_query, {"email": data.email})
+    user_row = result.fetchone()
 
-    # Placeholder - would normally validate against DB
-    raise AuthenticationError("Invalid email or password")
+    if not user_row:
+        raise AuthenticationError("Invalid email or password")
+
+    user = dict(user_row._mapping)
+
+    if not user["is_active"]:
+        raise AuthenticationError("Account is disabled")
+
+    # Verify password
+    if not verify_password(data.password, user["password_hash"]):
+        raise AuthenticationError("Invalid email or password")
+
+    # Get user's organization(s) - return first one
+    org_query = text("""
+        SELECT om.organization_id, om.role, o.name as org_name
+        FROM org_members om
+        JOIN organizations o ON om.organization_id = o.id
+        WHERE om.user_id = :user_id
+        LIMIT 1
+    """)
+    org_result = await session.execute(org_query, {"user_id": user["id"]})
+    org_row = org_result.fetchone()
+
+    org_id = None
+    role = None
+    org_name = None
+    if org_row:
+        org_data = dict(org_row._mapping)
+        org_id = org_data["organization_id"]
+        role = org_data["role"]
+        org_name = org_data["org_name"]
+
+    access_token = create_access_token({
+        "sub": user["id"],
+        "email": user["email"],
+        "org_id": org_id,
+        "role": role,
+    })
+    refresh_token = create_refresh_token({"sub": user["id"]})
+
+    return wrap_response({
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "name": user["name"],
+        },
+        "organization": {
+            "id": org_id,
+            "name": org_name,
+            "role": role,
+        } if org_id else None,
+        "tokens": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": settings.jwt_access_token_expire_minutes * 60,
+        },
+    })
 
 
 @router.post("/token", response_model=dict)
@@ -203,8 +308,9 @@ async def login_oauth(
 
     For integration with OAuth2 clients.
     """
-    # TODO: Validate credentials
-    raise AuthenticationError("Invalid credentials")
+    # Use the same login logic
+    login_data = LoginRequest(email=form_data.username, password=form_data.password)
+    return await login(login_data, session)
 
 
 @router.post("/refresh", response_model=dict)
@@ -227,12 +333,38 @@ async def refresh_token(
 
         user_id = payload.get("sub")
 
-        # TODO: Look up user and get current org
-        # For now, create new tokens with same claims
+        # Look up user and get current org
+        user_query = text("SELECT id, email FROM users WHERE id = :id AND is_active = 1")
+        user_result = await session.execute(user_query, {"id": user_id})
+        user_row = user_result.fetchone()
+
+        if not user_row:
+            raise AuthenticationError("User not found")
+
+        user = dict(user_row._mapping)
+
+        # Get org info
+        org_query = text("""
+            SELECT om.organization_id, om.role
+            FROM org_members om
+            WHERE om.user_id = :user_id
+            LIMIT 1
+        """)
+        org_result = await session.execute(org_query, {"user_id": user_id})
+        org_row = org_result.fetchone()
+
+        org_id = None
+        role = None
+        if org_row:
+            org_data = dict(org_row._mapping)
+            org_id = org_data["organization_id"]
+            role = org_data["role"]
 
         access_token = create_access_token({
             "sub": user_id,
-            # TODO: Include email, org_id, role from DB
+            "email": user["email"],
+            "org_id": org_id,
+            "role": role,
         })
 
         return wrap_response({
@@ -311,8 +443,27 @@ async def change_password(
     """
     Change the current user's password.
     """
-    # TODO: Verify current password
-    # TODO: Update password
+    # Get current password hash
+    query = text("SELECT password_hash FROM users WHERE id = :id")
+    result = await session.execute(query, {"id": str(user.user_id)})
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    row_dict = dict(row._mapping)
+
+    # Verify current password
+    if not verify_password(data.current_password, row_dict["password_hash"]):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    # Update password
+    new_hash = hash_password(data.new_password)
+    update_query = text("""
+        UPDATE users SET password_hash = :hash, updated_at = NOW() WHERE id = :id
+    """)
+    await session.execute(update_query, {"hash": new_hash, "id": str(user.user_id)})
+    await session.commit()
 
     return wrap_response({
         "message": "Password changed successfully",
@@ -369,6 +520,26 @@ async def get_current_user_info(
     """
     Get the current user's information.
     """
+    # Get full user info from database
+    query = text("""
+        SELECT id, email, name, email_verified, created_at
+        FROM users WHERE id = :id
+    """)
+    result = await session.execute(query, {"id": str(user.user_id)})
+    row = result.fetchone()
+
+    if row:
+        user_data = dict(row._mapping)
+        return wrap_response({
+            "id": user_data["id"],
+            "email": user_data["email"],
+            "name": user_data["name"],
+            "email_verified": bool(user_data["email_verified"]),
+            "organization_id": str(user.organization_id),
+            "role": user.role,
+            "created_at": user_data["created_at"].isoformat() if user_data["created_at"] else None,
+        })
+
     return wrap_response({
         "id": str(user.user_id),
         "email": user.email,
@@ -377,16 +548,23 @@ async def get_current_user_info(
     })
 
 
+class UpdateProfileRequest(BaseModel):
+    name: str | None = None
+
+
 @router.patch("/me", response_model=dict)
 async def update_current_user(
-    name: str | None = None,
-    user: CurrentUser = None,
-    session: DbSession = None,
+    data: UpdateProfileRequest,
+    user: CurrentUser,
+    session: DbSession,
 ):
     """
     Update the current user's profile.
     """
-    # TODO: Update user in database
+    if data.name:
+        query = text("UPDATE users SET name = :name, updated_at = NOW() WHERE id = :id")
+        await session.execute(query, {"name": data.name, "id": str(user.user_id)})
+        await session.commit()
 
     return wrap_response({
         "id": str(user.user_id),

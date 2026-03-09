@@ -150,10 +150,12 @@ app.include_router(plugins.router, prefix="/api/v1/plugins", tags=["Plugins"])
 # Webhooks
 app.include_router(webhooks.router, prefix="/api/v1/webhooks", tags=["Webhooks"])
 
-# SaaS-only routes (auth, billing, orgs)
+# Organization management (API keys, members - available in all modes)
+app.include_router(orgs.router, prefix="/api/v1/orgs", tags=["Organizations"])
+
+# SaaS-only routes (auth, billing)
 if settings.is_saas:
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
-    app.include_router(orgs.router, prefix="/api/v1/orgs", tags=["Organizations"])
     app.include_router(billing.router, prefix="/api/v1/billing", tags=["Billing"])
 
 

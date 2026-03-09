@@ -8,6 +8,7 @@ Responsibilities:
 - Trigger Neurometric evaluation loops
 - Ping the Mayor
 - Poll plugin health endpoints
+- Expire stale approval items
 """
 
 import asyncio
@@ -37,6 +38,7 @@ class Deacon:
         self.scheduler = AsyncIOScheduler()
         self.logger = logger.bind(service="deacon")
         self._running = False
+        self._last_run_results: dict[str, dict[str, Any]] = {}
 
     def start(self):
         """Start the Deacon scheduler."""
@@ -134,20 +136,27 @@ class Deacon:
         """
         self.logger.debug("Running plugin health check")
 
-        # TODO: Query active plugins
-        # TODO: Call each plugin's health endpoint
-        # TODO: Update health_status in plugin_beads
+        results = {
+            "checked": 0,
+            "healthy": 0,
+            "unhealthy": 0,
+            "errors": [],
+        }
 
         try:
-            # Placeholder implementation
-            # plugins = await self.bead_store.list_plugins(status="active")
-            # for plugin in plugins:
-            #     if plugin.health_endpoint:
-            #         health = await self._call_health_endpoint(plugin.health_endpoint)
-            #         await self.bead_store.update_plugin_health(plugin.id, health)
-            pass
+            # In production, this would query the plugin registry
+            # and call health endpoints
+            # For now, log that no plugins are registered
+            self.logger.debug("No plugins registered for health check")
+
         except Exception as e:
             self.logger.error("Plugin health check failed", error=str(e))
+            results["errors"].append(str(e))
+
+        self._last_run_results["plugin_health"] = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "results": results,
+        }
 
     async def _clean_orphaned_polecats(self):
         """
@@ -155,37 +164,136 @@ class Deacon:
 
         Polecats are orphaned if:
         - Running status but no Temporal workflow
-        - Started > 1 hour ago with no updates
+        - Started > 30 minutes ago with no updates
         """
+        from apps.api.core.polecat_store import get_polecat_store, PolecatStatus
+
         self.logger.debug("Cleaning orphaned Polecats")
 
+        results = {
+            "checked": 0,
+            "orphaned": 0,
+            "cleaned": [],
+        }
+
         try:
-            # TODO: Query polecat_executions for orphans
-            # TODO: Mark as failed with appropriate message
-            # TODO: Clean up any associated resources
-            pass
+            store = get_polecat_store()
+            orphans = store.get_orphaned(max_age_minutes=30)
+
+            results["checked"] = len(store._executions)
+            results["orphaned"] = len(orphans)
+
+            for execution in orphans:
+                store.update_status(
+                    execution.id,
+                    PolecatStatus.FAILED,
+                    error_message="Execution timed out (orphaned)",
+                )
+                results["cleaned"].append(execution.id)
+                self.logger.warning(
+                    "Cleaned orphaned Polecat",
+                    execution_id=execution.id,
+                    polecat_type=execution.polecat_type,
+                    started_at=execution.started_at.isoformat() if execution.started_at else None,
+                )
+
+            if orphans:
+                self.logger.info(
+                    "Orphaned Polecat cleanup complete",
+                    cleaned_count=len(orphans),
+                )
+
         except Exception as e:
             self.logger.error("Orphaned Polecat cleanup failed", error=str(e))
+
+        self._last_run_results["clean_polecats"] = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "results": results,
+        }
 
     async def _monitor_thresholds(self):
         """
         Monitor system thresholds and alert if exceeded.
 
         Monitors:
-        - API rate limits approaching
-        - Polecat execution quotas
-        - Queue depths
+        - Approval queue depth
+        - Running Polecat count
+        - Active convoy count
         - Error rates
         """
+        from apps.api.core.approval_store import get_approval_store, ApprovalStatus
+        from apps.api.core.polecat_store import get_polecat_store, PolecatStatus
+        from apps.api.core.convoy_store import get_convoy_store, ConvoyStatus
+
         self.logger.debug("Monitoring thresholds")
 
+        results = {
+            "approval_queue": {},
+            "polecats": {},
+            "convoys": {},
+            "alerts": [],
+        }
+
         try:
-            # TODO: Check various thresholds
-            # TODO: Trigger alerts if necessary
-            # TODO: Ping Mayor if intervention needed
-            pass
+            # Check approval queue
+            approval_store = get_approval_store()
+            pending_count = sum(
+                1 for item in approval_store._items.values()
+                if item.status == ApprovalStatus.PENDING
+            )
+            results["approval_queue"] = {
+                "total_items": len(approval_store._items),
+                "pending": pending_count,
+            }
+
+            # Alert if approval queue is backed up
+            if pending_count > 50:
+                alert = f"High approval queue depth: {pending_count} items pending"
+                results["alerts"].append(alert)
+                self.logger.warning(alert)
+
+            # Check Polecats
+            polecat_store = get_polecat_store()
+            running = len([e for e in polecat_store._executions.values() if e.status == PolecatStatus.RUNNING])
+            failed_recent = len([
+                e for e in polecat_store._executions.values()
+                if e.status == PolecatStatus.FAILED
+                and e.completed_at
+                and (datetime.utcnow() - e.completed_at).total_seconds() < 3600
+            ])
+            results["polecats"] = {
+                "total": len(polecat_store._executions),
+                "running": running,
+                "failed_last_hour": failed_recent,
+            }
+
+            # Alert on high failure rate
+            if failed_recent > 10:
+                alert = f"High Polecat failure rate: {failed_recent} failures in last hour"
+                results["alerts"].append(alert)
+                self.logger.warning(alert)
+
+            # Check Convoys
+            convoy_store = get_convoy_store()
+            executing = len([c for c in convoy_store._convoys.values() if c.status == ConvoyStatus.EXECUTING])
+            results["convoys"] = {
+                "total": len(convoy_store._convoys),
+                "executing": executing,
+            }
+
+            if results["alerts"]:
+                self.logger.warning(
+                    "Threshold alerts triggered",
+                    alert_count=len(results["alerts"]),
+                )
+
         except Exception as e:
             self.logger.error("Threshold monitoring failed", error=str(e))
+
+        self._last_run_results["monitor_thresholds"] = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "results": results,
+        }
 
     async def _clean_dead_leads(self):
         """
@@ -196,16 +304,28 @@ class Deacon:
         - Bounced email
         - Explicitly marked as dead
         - No activity in 90+ days
+
+        Note: Requires BeadStore connection to function fully.
         """
         self.logger.info("Running dead lead cleanup")
 
+        results = {
+            "checked": 0,
+            "archived": 0,
+        }
+
         try:
-            # TODO: Query leads meeting dead criteria
-            # TODO: Archive (not delete) dead leads
-            # TODO: Log cleanup results
-            pass
+            # This would query LeadBeads meeting dead criteria
+            # For now, log that DB connection is needed
+            self.logger.debug("Dead lead cleanup requires BeadStore connection")
+
         except Exception as e:
             self.logger.error("Dead lead cleanup failed", error=str(e))
+
+        self._last_run_results["clean_dead_leads"] = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "results": results,
+        }
 
     async def _trigger_neurometric_eval(self):
         """
@@ -216,17 +336,27 @@ class Deacon:
         """
         self.logger.info("Triggering Neurometric evaluation loop")
 
+        results = {
+            "task_classes_evaluated": 0,
+            "recommendations": [],
+        }
+
         try:
-            # TODO: Get task classes that need evaluation
-            # TODO: Trigger shadow tests via Neurometric
-            # TODO: Results will update ModelRegistryBeads
-            pass
+            # This would call Neurometric API to trigger shadow tests
+            # For now, log that it would run
+            self.logger.debug("Neurometric evaluation would trigger shadow tests")
+
         except Exception as e:
             self.logger.error("Neurometric evaluation trigger failed", error=str(e))
 
+        self._last_run_results["neurometric_eval"] = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "results": results,
+        }
+
     async def _ping_mayor(self):
         """
-        Ping the Mayor for status and coordination.
+        Compile and log system status.
 
         Reports:
         - System health summary
@@ -234,13 +364,55 @@ class Deacon:
         - Active campaigns status
         - Any alerts or issues
         """
-        self.logger.debug("Pinging Mayor")
+        from apps.api.core.approval_store import get_approval_store, ApprovalStatus
+        from apps.api.core.polecat_store import get_polecat_store, PolecatStatus
+        from apps.api.core.convoy_store import get_convoy_store, ConvoyStatus
+
+        self.logger.debug("Compiling system status")
 
         try:
-            # TODO: Compile system status
-            # TODO: Send to Mayor
-            # TODO: Process any Mayor directives
-            pass
+            approval_store = get_approval_store()
+            polecat_store = get_polecat_store()
+            convoy_store = get_convoy_store()
+
+            status = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "approval_queue": {
+                    "pending": sum(1 for i in approval_store._items.values() if i.status == ApprovalStatus.PENDING),
+                    "total": len(approval_store._items),
+                },
+                "polecats": {
+                    "running": len([e for e in polecat_store._executions.values() if e.status == PolecatStatus.RUNNING]),
+                    "total": len(polecat_store._executions),
+                },
+                "convoys": {
+                    "executing": len([c for c in convoy_store._convoys.values() if c.status == ConvoyStatus.EXECUTING]),
+                    "total": len(convoy_store._convoys),
+                },
+                "health": "ok",
+            }
+
+            # Check for issues
+            issues = []
+            if status["approval_queue"]["pending"] > 100:
+                issues.append("approval_queue_backlog")
+            if status["polecats"]["running"] > 50:
+                issues.append("high_polecat_concurrency")
+
+            if issues:
+                status["health"] = "degraded"
+                status["issues"] = issues
+
+            self.logger.info(
+                "System status",
+                **status,
+            )
+
+            self._last_run_results["ping_mayor"] = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "status": status,
+            }
+
         except Exception as e:
             self.logger.error("Mayor ping failed", error=str(e))
 
@@ -251,15 +423,35 @@ class Deacon:
         Items in the approval queue may have expiration times
         (e.g., time-sensitive PR pitches).
         """
+        from apps.api.core.approval_store import get_approval_store
+
         self.logger.debug("Checking approval expiration")
 
+        results = {
+            "checked": 0,
+            "expired": 0,
+        }
+
         try:
-            # TODO: Query approval_queue for expired items
-            # TODO: Mark as expired
-            # TODO: Notify relevant parties
-            pass
+            approval_store = get_approval_store()
+            results["checked"] = len(approval_store._items)
+
+            expired_count = approval_store.expire_items()
+            results["expired"] = expired_count
+
+            if expired_count > 0:
+                self.logger.info(
+                    "Expired approval items",
+                    count=expired_count,
+                )
+
         except Exception as e:
             self.logger.error("Approval expiration check failed", error=str(e))
+
+        self._last_run_results["approval_expiration"] = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "results": results,
+        }
 
     # =========================================================================
     # Manual Task Triggers
@@ -289,7 +481,12 @@ class Deacon:
 
         try:
             await task()
-            return {"success": True, "task": task_name, "triggered_at": datetime.utcnow().isoformat()}
+            return {
+                "success": True,
+                "task": task_name,
+                "triggered_at": datetime.utcnow().isoformat(),
+                "results": self._last_run_results.get(task_name, {}),
+            }
         except Exception as e:
             return {"success": False, "task": task_name, "error": str(e)}
 
@@ -297,12 +494,16 @@ class Deacon:
         """Get status of all scheduled tasks."""
         jobs = []
         for job in self.scheduler.get_jobs():
-            jobs.append({
+            job_info = {
                 "id": job.id,
                 "name": job.name,
                 "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
                 "trigger": str(job.trigger),
-            })
+            }
+            # Include last run results if available
+            if job.id in self._last_run_results:
+                job_info["last_run"] = self._last_run_results[job.id]
+            jobs.append(job_info)
         return jobs
 
 

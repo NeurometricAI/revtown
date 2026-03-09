@@ -2,12 +2,15 @@
 FastAPI Dependencies - Dependency injection for auth, database, and services.
 """
 
+import hashlib
+from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.config import settings
@@ -117,14 +120,64 @@ async def _authenticate_jwt(token: str) -> TokenData:
 
 
 async def _authenticate_api_key(api_key: str) -> TokenData:
-    """Authenticate via API key."""
-    # TODO: Look up API key in database
-    # For now, return a placeholder
-    # In production, this would:
-    # 1. Hash the API key
-    # 2. Look up in api_keys table
-    # 3. Return associated org and scopes
-    raise AuthenticationError("API key authentication not yet implemented")
+    """
+    Authenticate via API key.
+
+    API keys are stored as SHA256 hashes. The key_prefix column allows
+    quick lookup before hash comparison.
+    """
+    # Extract prefix (e.g., "rtk_abc123..." -> "rtk_abc123")
+    # The prefix includes the rtk_ and first 8 chars of the key
+    if len(api_key) < 12:
+        raise AuthenticationError("Invalid API key format")
+
+    key_prefix = api_key[:12]  # "rtk_" + 8 chars
+
+    # Hash the full key for comparison
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+    # Look up in database
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        query = text("""
+            SELECT ak.id, ak.organization_id, ak.key_hash, ak.is_active,
+                   ak.expires_at, ak.scopes, ak.created_by,
+                   o.name as org_name
+            FROM api_keys ak
+            JOIN organizations o ON ak.organization_id = o.id
+            WHERE ak.key_prefix = :key_prefix
+            AND ak.is_active = 1
+        """)
+
+        result = await session.execute(query, {"key_prefix": key_prefix})
+        row = result.fetchone()
+
+        if not row:
+            raise AuthenticationError("Invalid API key")
+
+        row_dict = dict(row._mapping)
+
+        # Verify hash matches
+        if row_dict["key_hash"] != key_hash:
+            raise AuthenticationError("Invalid API key")
+
+        # Check expiration
+        if row_dict["expires_at"] and row_dict["expires_at"] < datetime.utcnow():
+            raise AuthenticationError("API key has expired")
+
+        # Update last_used_at
+        update_query = text("""
+            UPDATE api_keys SET last_used_at = NOW() WHERE id = :key_id
+        """)
+        await session.execute(update_query, {"key_id": row_dict["id"]})
+        await session.commit()
+
+        return TokenData(
+            user_id=UUID(row_dict["created_by"]),
+            organization_id=UUID(row_dict["organization_id"]),
+            email=f"api-key@{row_dict['org_name'].lower().replace(' ', '-')}.local",
+            role="api",  # API keys get a special role
+        )
 
 
 async def get_current_user_optional(

@@ -6,14 +6,17 @@ Base path: /api/v1/neurometric
 All LLM calls MUST route through the Neurometric gateway.
 """
 
+import json
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import text
 
-from apps.api.dependencies import AdminUser, CurrentUser, ScopedBeadStore
+from apps.api.dependencies import AdminUser, CurrentUser, DbSession, ScopedBeadStore
 from apps.api.models.beads import EvaluationStatus, ModelRegistryBeadCreate, ModelRegistryBeadUpdate
 
 router = APIRouter()
@@ -38,7 +41,7 @@ def wrap_response(data: Any, meta: dict[str, Any] | None = None) -> dict[str, An
 
 @router.get("/registry", response_model=dict)
 async def get_model_registry(
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
 ):
     """
@@ -47,72 +50,153 @@ async def get_model_registry(
     The registry determines which model is used for each task class.
     Organization-specific overrides take precedence over global defaults.
     """
-    # TODO: Query model_registry_beads table
-    # Return global defaults + org overrides
+    # Get global defaults (organization_id IS NULL)
+    defaults_query = text("""
+        SELECT id, task_class, default_model, fallback_model, evaluation_status,
+               max_tokens, temperature, last_evaluated_at
+        FROM model_registry_beads
+        WHERE organization_id IS NULL AND status = 'active'
+        ORDER BY task_class
+    """)
+    defaults_result = await session.execute(defaults_query)
+    defaults = []
+    for row in defaults_result.fetchall():
+        row_dict = dict(row._mapping)
+        defaults.append({
+            "id": row_dict["id"],
+            "task_class": row_dict["task_class"],
+            "default_model": row_dict["default_model"],
+            "fallback_model": row_dict["fallback_model"],
+            "evaluation_status": row_dict["evaluation_status"],
+            "max_tokens": row_dict["max_tokens"],
+            "temperature": float(row_dict["temperature"]) if row_dict["temperature"] else 0.7,
+            "last_evaluated_at": row_dict["last_evaluated_at"].isoformat() if row_dict["last_evaluated_at"] else None,
+        })
+
+    # Get org-specific overrides
+    overrides_query = text("""
+        SELECT id, task_class, default_model, fallback_model, evaluation_status,
+               max_tokens, temperature, last_evaluated_at
+        FROM model_registry_beads
+        WHERE organization_id = :org_id AND status = 'active'
+        ORDER BY task_class
+    """)
+    overrides_result = await session.execute(overrides_query, {"org_id": str(user.organization_id)})
+    org_overrides = []
+    for row in overrides_result.fetchall():
+        row_dict = dict(row._mapping)
+        org_overrides.append({
+            "id": row_dict["id"],
+            "task_class": row_dict["task_class"],
+            "default_model": row_dict["default_model"],
+            "fallback_model": row_dict["fallback_model"],
+            "evaluation_status": row_dict["evaluation_status"],
+            "max_tokens": row_dict["max_tokens"],
+            "temperature": float(row_dict["temperature"]) if row_dict["temperature"] else 0.7,
+            "last_evaluated_at": row_dict["last_evaluated_at"].isoformat() if row_dict["last_evaluated_at"] else None,
+        })
+
     return wrap_response({
-        "defaults": [
-            {
-                "task_class": "blog_draft",
-                "default_model": "claude-sonnet-4-5-20250929",
-                "evaluation_status": "confirmed_optimal",
-            },
-            {
-                "task_class": "email_personalization",
-                "default_model": "claude-haiku-4-5-20251001",
-                "evaluation_status": "confirmed_optimal",
-            },
-            {
-                "task_class": "competitor_analysis",
-                "default_model": "claude-opus-4-5-20251101",
-                "evaluation_status": "under_evaluation",
-            },
-            {
-                "task_class": "subject_line_ab",
-                "default_model": "claude-haiku-4-5-20251001",
-                "evaluation_status": "confirmed_optimal",
-            },
-            {
-                "task_class": "pr_pitch_draft",
-                "default_model": "claude-sonnet-4-5-20250929",
-                "evaluation_status": "confirmed_optimal",
-            },
-            {
-                "task_class": "statistical_significance",
-                "default_model": "claude-sonnet-4-5-20250929",
-                "evaluation_status": "confirmed_optimal",
-            },
-        ],
-        "org_overrides": [],
+        "defaults": defaults,
+        "org_overrides": org_overrides,
     })
 
 
 @router.get("/registry/{task_class}", response_model=dict)
 async def get_model_for_task(
     task_class: str,
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
 ):
     """Get the recommended model for a specific task class."""
-    # TODO: Look up in model_registry_beads
-    return wrap_response({
+    # First check for org-specific override
+    org_query = text("""
+        SELECT id, task_class, default_model, fallback_model, evaluation_status,
+               max_tokens, temperature, evaluation_metrics
+        FROM model_registry_beads
+        WHERE organization_id = :org_id AND task_class = :task_class AND status = 'active'
+        LIMIT 1
+    """)
+    org_result = await session.execute(org_query, {
+        "org_id": str(user.organization_id),
         "task_class": task_class,
-        "default_model": "claude-sonnet-4-5-20250929",
-        "fallback_model": None,
-        "evaluation_status": "confirmed_optimal",
-        "max_tokens": None,
-        "temperature": 0.7,
+    })
+    row = org_result.fetchone()
+
+    # If no org override, get global default
+    if not row:
+        global_query = text("""
+            SELECT id, task_class, default_model, fallback_model, evaluation_status,
+                   max_tokens, temperature, evaluation_metrics
+            FROM model_registry_beads
+            WHERE organization_id IS NULL AND task_class = :task_class AND status = 'active'
+            LIMIT 1
+        """)
+        global_result = await session.execute(global_query, {"task_class": task_class})
+        row = global_result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No model configuration found for task class: {task_class}")
+
+    row_dict = dict(row._mapping)
+    metrics = row_dict.get("evaluation_metrics")
+    if metrics and isinstance(metrics, str):
+        metrics = json.loads(metrics)
+
+    return wrap_response({
+        "id": row_dict["id"],
+        "task_class": row_dict["task_class"],
+        "default_model": row_dict["default_model"],
+        "fallback_model": row_dict["fallback_model"],
+        "evaluation_status": row_dict["evaluation_status"],
+        "max_tokens": row_dict["max_tokens"],
+        "temperature": float(row_dict["temperature"]) if row_dict["temperature"] else 0.7,
+        "evaluation_metrics": metrics,
     })
 
 
 @router.post("/registry", response_model=dict)
 async def create_model_override(
     data: ModelRegistryBeadCreate,
-    store: ScopedBeadStore,
-    user: AdminUser,  # Admin only
+    session: DbSession,
+    user: AdminUser,
 ):
     """Create an organization-specific model override."""
-    # TODO: Create model_registry_bead
+    bead_id = uuid4()
+
+    # Check if override already exists
+    check_query = text("""
+        SELECT id FROM model_registry_beads
+        WHERE organization_id = :org_id AND task_class = :task_class AND status = 'active'
+    """)
+    existing = await session.execute(check_query, {
+        "org_id": str(user.organization_id),
+        "task_class": data.task_class,
+    })
+    if existing.fetchone():
+        raise HTTPException(status_code=400, detail=f"Override already exists for task class: {data.task_class}")
+
+    query = text("""
+        INSERT INTO model_registry_beads
+        (id, type, organization_id, task_class, default_model, fallback_model,
+         max_tokens, temperature, status, version, created_at, updated_at)
+        VALUES (:id, 'model_registry', :org_id, :task_class, :default_model, :fallback_model,
+                :max_tokens, :temperature, 'active', 1, NOW(), NOW())
+    """)
+
+    await session.execute(query, {
+        "id": str(bead_id),
+        "org_id": str(user.organization_id),
+        "task_class": data.task_class,
+        "default_model": data.default_model,
+        "fallback_model": data.fallback_model,
+        "max_tokens": data.max_tokens,
+        "temperature": float(data.temperature) if data.temperature else 0.7,
+    })
+    await session.commit()
+
     return wrap_response({
+        "id": str(bead_id),
         "task_class": data.task_class,
         "default_model": data.default_model,
         "message": "Model override created",
@@ -123,11 +207,60 @@ async def create_model_override(
 async def update_model_config(
     task_class: str,
     data: ModelRegistryBeadUpdate,
-    store: ScopedBeadStore,
+    session: DbSession,
     user: AdminUser,
 ):
     """Update model configuration for a task class."""
-    # TODO: Update model_registry_bead
+    # Find the org-specific override
+    find_query = text("""
+        SELECT id, version FROM model_registry_beads
+        WHERE organization_id = :org_id AND task_class = :task_class AND status = 'active'
+    """)
+    result = await session.execute(find_query, {
+        "org_id": str(user.organization_id),
+        "task_class": task_class,
+    })
+    row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No override found for task class: {task_class}. Create one first.")
+
+    row_dict = dict(row._mapping)
+
+    # Build update query
+    update_fields = []
+    params = {
+        "id": row_dict["id"],
+        "new_version": row_dict["version"] + 1,
+    }
+
+    update_data = data.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        if key == "evaluation_status" and value is not None:
+            params[key] = value.value if hasattr(value, 'value') else value
+        elif key == "evaluation_metrics" and value is not None:
+            params[key] = json.dumps(value)
+        elif key == "temperature" and value is not None:
+            params[key] = float(value)
+        else:
+            params[key] = value
+        update_fields.append(f"{key} = :{key}")
+
+    if not update_fields:
+        return wrap_response({"task_class": task_class, "updated": False, "message": "No fields to update"})
+
+    update_fields.append("version = :new_version")
+    update_fields.append("updated_at = NOW()")
+
+    query = text(f"""
+        UPDATE model_registry_beads
+        SET {", ".join(update_fields)}
+        WHERE id = :id
+    """)
+
+    await session.execute(query, params)
+    await session.commit()
+
     return wrap_response({
         "task_class": task_class,
         "updated": True,

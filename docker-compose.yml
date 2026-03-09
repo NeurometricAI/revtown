@@ -141,12 +141,14 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - REVTOWN_MODE=self-hosted
+      - REVTOWN_MODE=saas
       - REVTOWN_ENV=development
       - DEBUG=true
       - DOLT_HOST=dolt
       - DOLT_PORT=3306
       - DOLT_DATABASE=revtown
+      - DOLT_USER=revtown
+      - DOLT_PASSWORD=revtown
       - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
       - TEMPORAL_HOST=temporal:7233
       - VAULT_ADDR=http://vault:8200
