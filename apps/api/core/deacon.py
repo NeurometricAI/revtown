@@ -22,6 +22,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from apps.api.config import settings
+from apps.api.dependencies import get_session_factory
 
 logger = structlog.get_logger()
 
@@ -178,24 +179,26 @@ class Deacon:
 
         try:
             store = get_polecat_store()
-            orphans = store.get_orphaned(max_age_minutes=30)
+            session_factory = get_session_factory()
 
-            results["checked"] = len(store._executions)
-            results["orphaned"] = len(orphans)
+            async with session_factory() as session:
+                orphans = await store.get_orphaned(session, max_age_minutes=30)
+                results["orphaned"] = len(orphans)
 
-            for execution in orphans:
-                store.update_status(
-                    execution.id,
-                    PolecatStatus.FAILED,
-                    error_message="Execution timed out (orphaned)",
-                )
-                results["cleaned"].append(execution.id)
-                self.logger.warning(
-                    "Cleaned orphaned Polecat",
-                    execution_id=execution.id,
-                    polecat_type=execution.polecat_type,
-                    started_at=execution.started_at.isoformat() if execution.started_at else None,
-                )
+                for execution in orphans:
+                    await store.update_status(
+                        session,
+                        execution.id,
+                        PolecatStatus.FAILED,
+                        error_message="Execution timed out (orphaned)",
+                    )
+                    results["cleaned"].append(execution.id)
+                    self.logger.warning(
+                        "Cleaned orphaned Polecat",
+                        execution_id=execution.id,
+                        polecat_type=execution.polecat_type,
+                        started_at=execution.started_at.isoformat() if execution.started_at else None,
+                    )
 
             if orphans:
                 self.logger.info(
@@ -235,51 +238,48 @@ class Deacon:
         }
 
         try:
-            # Check approval queue
-            approval_store = get_approval_store()
-            pending_count = sum(
-                1 for item in approval_store._items.values()
-                if item.status == ApprovalStatus.PENDING
-            )
-            results["approval_queue"] = {
-                "total_items": len(approval_store._items),
-                "pending": pending_count,
-            }
+            session_factory = get_session_factory()
 
-            # Alert if approval queue is backed up
-            if pending_count > 50:
-                alert = f"High approval queue depth: {pending_count} items pending"
-                results["alerts"].append(alert)
-                self.logger.warning(alert)
+            async with session_factory() as session:
+                # Check approval queue
+                approval_store = get_approval_store()
+                pending_items, pending_count = await approval_store.get_queue(
+                    session=session,
+                    organization_id=None,  # All orgs
+                    status=ApprovalStatus.PENDING,
+                    limit=1,
+                )
+                results["approval_queue"] = {
+                    "pending": pending_count,
+                }
 
-            # Check Polecats
-            polecat_store = get_polecat_store()
-            running = len([e for e in polecat_store._executions.values() if e.status == PolecatStatus.RUNNING])
-            failed_recent = len([
-                e for e in polecat_store._executions.values()
-                if e.status == PolecatStatus.FAILED
-                and e.completed_at
-                and (datetime.utcnow() - e.completed_at).total_seconds() < 3600
-            ])
-            results["polecats"] = {
-                "total": len(polecat_store._executions),
-                "running": running,
-                "failed_last_hour": failed_recent,
-            }
+                # Alert if approval queue is backed up
+                if pending_count > 50:
+                    alert = f"High approval queue depth: {pending_count} items pending"
+                    results["alerts"].append(alert)
+                    self.logger.warning(alert)
 
-            # Alert on high failure rate
-            if failed_recent > 10:
-                alert = f"High Polecat failure rate: {failed_recent} failures in last hour"
-                results["alerts"].append(alert)
-                self.logger.warning(alert)
+                # Check Polecats - running
+                polecat_store = get_polecat_store()
+                running_executions = await polecat_store.get_running(session)
+                running_count = len(running_executions)
+                results["polecats"] = {
+                    "running": running_count,
+                }
 
-            # Check Convoys
-            convoy_store = get_convoy_store()
-            executing = len([c for c in convoy_store._convoys.values() if c.status == ConvoyStatus.EXECUTING])
-            results["convoys"] = {
-                "total": len(convoy_store._convoys),
-                "executing": executing,
-            }
+                # Alert on high concurrency
+                if running_count > 50:
+                    alert = f"High Polecat concurrency: {running_count} running"
+                    results["alerts"].append(alert)
+                    self.logger.warning(alert)
+
+                # Check Convoys (still in-memory for now)
+                convoy_store = get_convoy_store()
+                executing = len([c for c in convoy_store._convoys.values() if c.status == ConvoyStatus.EXECUTING])
+                results["convoys"] = {
+                    "total": len(convoy_store._convoys),
+                    "executing": executing,
+                }
 
             if results["alerts"]:
                 self.logger.warning(
@@ -374,23 +374,35 @@ class Deacon:
             approval_store = get_approval_store()
             polecat_store = get_polecat_store()
             convoy_store = get_convoy_store()
+            session_factory = get_session_factory()
 
-            status = {
-                "timestamp": datetime.utcnow().isoformat(),
-                "approval_queue": {
-                    "pending": sum(1 for i in approval_store._items.values() if i.status == ApprovalStatus.PENDING),
-                    "total": len(approval_store._items),
-                },
-                "polecats": {
-                    "running": len([e for e in polecat_store._executions.values() if e.status == PolecatStatus.RUNNING]),
-                    "total": len(polecat_store._executions),
-                },
-                "convoys": {
-                    "executing": len([c for c in convoy_store._convoys.values() if c.status == ConvoyStatus.EXECUTING]),
-                    "total": len(convoy_store._convoys),
-                },
-                "health": "ok",
-            }
+            async with session_factory() as session:
+                # Get pending approval count
+                _, pending_count = await approval_store.get_queue(
+                    session=session,
+                    organization_id=None,
+                    status=ApprovalStatus.PENDING,
+                    limit=1,
+                )
+
+                # Get running polecats
+                running_executions = await polecat_store.get_running(session)
+                running_count = len(running_executions)
+
+                status = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "approval_queue": {
+                        "pending": pending_count,
+                    },
+                    "polecats": {
+                        "running": running_count,
+                    },
+                    "convoys": {
+                        "executing": len([c for c in convoy_store._convoys.values() if c.status == ConvoyStatus.EXECUTING]),
+                        "total": len(convoy_store._convoys),
+                    },
+                    "health": "ok",
+                }
 
             # Check for issues
             issues = []
@@ -434,10 +446,11 @@ class Deacon:
 
         try:
             approval_store = get_approval_store()
-            results["checked"] = len(approval_store._items)
+            session_factory = get_session_factory()
 
-            expired_count = approval_store.expire_items()
-            results["expired"] = expired_count
+            async with session_factory() as session:
+                expired_count = await approval_store.expire_items(session)
+                results["expired"] = expired_count
 
             if expired_count > 0:
                 self.logger.info(

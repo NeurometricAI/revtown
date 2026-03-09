@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from apps.api.dependencies import CurrentUser, ScopedBeadStore
+from apps.api.dependencies import CurrentUser, DbSession, ScopedBeadStore, get_session_factory
 from apps.api.core.polecat_store import (
     PolecatExecution,
     PolecatStatus,
@@ -169,8 +169,11 @@ async def execute_polecat(execution: PolecatExecution, store: PolecatStore):
     """Execute a Polecat in the background."""
     from polecats.base import get_polecat_class
 
+    session_factory = get_session_factory()
+
     # Update to running
-    store.update_status(execution.id, PolecatStatus.RUNNING)
+    async with session_factory() as session:
+        await store.update_status(session, execution.id, PolecatStatus.RUNNING)
 
     try:
         # Try to get a registered Polecat class
@@ -194,30 +197,35 @@ async def execute_polecat(execution: PolecatExecution, store: PolecatStore):
             approval_item_id = await _queue_for_approval(execution, result)
 
         # Update execution with results
-        store.update_status(
-            execution.id,
-            PolecatStatus.COMPLETED,
-            output_content=result.get("output"),
-            output_bead_ids=result.get("output_bead_ids", []),
-            refinery_scores={"overall": result.get("refinery_score", 1.0)},
-            refinery_passed=result.get("refinery_passed", True),
-            witness_passed=result.get("witness_passed", True),
-            requires_approval=requires_approval,
-            approval_item_id=approval_item_id,
-            model_used=result.get("model_used"),
-            tokens_input=result.get("tokens_input", 0),
-            tokens_output=result.get("tokens_output", 0),
-        )
+        async with session_factory() as session:
+            await store.update_status(
+                session,
+                execution.id,
+                PolecatStatus.COMPLETED,
+                output_content=result.get("output"),
+                output_bead_ids=result.get("output_bead_ids", []),
+                refinery_scores={"overall": result.get("refinery_score", 1.0)},
+                refinery_passed=result.get("refinery_passed", True),
+                witness_passed=result.get("witness_passed", True),
+                requires_approval=requires_approval,
+                approval_item_id=approval_item_id,
+                model_used=result.get("model_used"),
+                tokens_input=result.get("tokens_input", 0),
+                tokens_output=result.get("tokens_output", 0),
+            )
 
     except asyncio.CancelledError:
-        store.update_status(execution.id, PolecatStatus.CANCELLED)
+        async with session_factory() as session:
+            await store.update_status(session, execution.id, PolecatStatus.CANCELLED)
         raise
     except Exception as e:
-        store.update_status(
-            execution.id,
-            PolecatStatus.FAILED,
-            error_message=str(e),
-        )
+        async with session_factory() as session:
+            await store.update_status(
+                session,
+                execution.id,
+                PolecatStatus.FAILED,
+                error_message=str(e),
+            )
 
 
 async def _execute_real_polecat(
@@ -343,6 +351,7 @@ async def _queue_for_approval(
         urgency=urgency,
         organization_id=execution.organization_id,
         campaign_id=execution.campaign_id,
+        polecat_execution_id=execution.id,
         preview_title=f"{execution.polecat_type.replace('_', ' ').title()}",
         preview_content=result.get("output", "")[:200] if result.get("output") else None,
         full_content=result.get("output"),
@@ -351,7 +360,11 @@ async def _queue_for_approval(
         witness_passed=result.get("witness_passed", True),
     )
 
-    approval_store.create(item)
+    # Create session for database operation
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        await approval_store.create(session, item)
+
     return item.id
 
 
@@ -363,6 +376,7 @@ async def _queue_for_approval(
 @router.post("", response_model=dict)
 async def spawn_polecat(
     request: SpawnPolecatRequest,
+    session: DbSession,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
@@ -398,11 +412,11 @@ async def spawn_polecat(
         campaign_id=str(request.campaign_id) if request.campaign_id else None,
         config=request.config or {},
     )
-    polecat_store.create(execution)
+    await polecat_store.create(session, execution)
 
     # Start execution in background
     task = asyncio.create_task(execute_polecat(execution, polecat_store))
-    execution._task = task
+    polecat_store.register_task(execution.id, task)
 
     return wrap_response({
         "polecat_id": execution.id,
@@ -417,12 +431,13 @@ async def spawn_polecat(
 @router.get("/{polecat_id}/status", response_model=dict)
 async def get_polecat_status(
     polecat_id: str,
+    session: DbSession,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
     """Get the status of a Polecat execution."""
     polecat_store = get_polecat_store()
-    execution = polecat_store.get(polecat_id)
+    execution = await polecat_store.get(session, polecat_id)
 
     if not execution:
         raise HTTPException(status_code=404, detail="Polecat execution not found")
@@ -448,12 +463,13 @@ async def get_polecat_status(
 @router.get("/{polecat_id}", response_model=dict)
 async def get_polecat(
     polecat_id: str,
+    session: DbSession,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
     """Get full details of a Polecat execution."""
     polecat_store = get_polecat_store()
-    execution = polecat_store.get(polecat_id)
+    execution = await polecat_store.get(session, polecat_id)
 
     if not execution:
         raise HTTPException(status_code=404, detail="Polecat execution not found")
@@ -468,12 +484,13 @@ async def get_polecat(
 @router.post("/{polecat_id}/cancel", response_model=dict)
 async def cancel_polecat(
     polecat_id: str,
+    session: DbSession,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
     """Cancel a running Polecat execution."""
     polecat_store = get_polecat_store()
-    execution = polecat_store.get(polecat_id)
+    execution = await polecat_store.get(session, polecat_id)
 
     if not execution:
         raise HTTPException(status_code=404, detail="Polecat execution not found")
@@ -488,7 +505,7 @@ async def cancel_polecat(
             detail=f"Cannot cancel execution in status: {execution.status.value}",
         )
 
-    polecat_store.cancel(polecat_id)
+    await polecat_store.cancel(session, polecat_id)
 
     return wrap_response({
         "polecat_id": polecat_id,
@@ -499,6 +516,7 @@ async def cancel_polecat(
 
 @router.get("", response_model=dict)
 async def list_polecats(
+    session: DbSession,
     store: ScopedBeadStore,
     user: CurrentUser,
     rig: Rig | None = None,
@@ -511,7 +529,8 @@ async def list_polecats(
     polecat_store = get_polecat_store()
     org_id = str(user.organization_id) if user.organization_id else ""
 
-    executions, total = polecat_store.list_executions(
+    executions, total = await polecat_store.list_executions(
+        session=session,
         organization_id=org_id,
         rig=rig.value if rig else None,
         status=status,

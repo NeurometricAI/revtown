@@ -1,19 +1,20 @@
 """
 Polecat Store - Persistence layer for Polecat executions.
 
-Tracks Polecat execution state across API requests.
-In production, this would be backed by Redis or the database.
-For now, using in-memory storage with a module-level singleton.
+Database-backed store using the polecat_executions table.
 """
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import structlog
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = structlog.get_logger()
 
@@ -37,6 +38,7 @@ class PolecatExecution:
     organization_id: str
     campaign_id: str | None = None
     config: dict[str, Any] = field(default_factory=dict)
+    task_class: str | None = None
 
     # Status
     status: PolecatStatus = PolecatStatus.PENDING
@@ -53,6 +55,7 @@ class PolecatExecution:
     refinery_scores: dict[str, Any] = field(default_factory=dict)
     refinery_passed: bool | None = None
     witness_passed: bool | None = None
+    witness_notes: str | None = None
     requires_approval: bool = False
     approval_item_id: str | None = None
 
@@ -61,10 +64,14 @@ class PolecatExecution:
     tokens_input: int = 0
     tokens_output: int = 0
 
+    # Temporal
+    temporal_workflow_id: str | None = None
+    temporal_run_id: str | None = None
+
     # Error
     error_message: str | None = None
 
-    # Internal
+    # Internal (not persisted)
     _task: asyncio.Task | None = field(default=None, repr=False)
 
     @property
@@ -81,6 +88,7 @@ class PolecatExecution:
             "bead_id": self.bead_id,
             "organization_id": self.organization_id,
             "campaign_id": self.campaign_id,
+            "task_class": self.task_class,
             "status": self.status.value,
             "progress": self.progress,
             "created_at": self.created_at.isoformat(),
@@ -99,40 +107,78 @@ class PolecatExecution:
             "error_message": self.error_message,
         }
 
+    @classmethod
+    def from_row(cls, row_dict: dict[str, Any]) -> "PolecatExecution":
+        """Create a PolecatExecution from a database row."""
+        # Parse JSON fields
+        output_bead_ids = row_dict.get("output_bead_ids")
+        if output_bead_ids and isinstance(output_bead_ids, str):
+            output_bead_ids = json.loads(output_bead_ids)
+
+        refinery_scores = row_dict.get("refinery_scores")
+        if refinery_scores and isinstance(refinery_scores, str):
+            refinery_scores = json.loads(refinery_scores)
+
+        return cls(
+            id=row_dict["id"],
+            polecat_type=row_dict["polecat_type"],
+            rig=row_dict["rig"],
+            bead_id=row_dict.get("input_bead_id", ""),
+            organization_id=row_dict["organization_id"],
+            campaign_id=row_dict.get("campaign_id"),
+            task_class=row_dict.get("task_class"),
+            status=PolecatStatus(row_dict["status"]),
+            created_at=row_dict.get("started_at") or datetime.utcnow(),  # Use started_at as proxy
+            started_at=row_dict.get("started_at"),
+            completed_at=row_dict.get("completed_at"),
+            output_bead_ids=output_bead_ids or [],
+            refinery_scores=refinery_scores or {},
+            refinery_passed=bool(row_dict.get("refinery_passed")) if row_dict.get("refinery_passed") is not None else None,
+            witness_passed=bool(row_dict.get("witness_passed")) if row_dict.get("witness_passed") is not None else None,
+            witness_notes=row_dict.get("witness_notes"),
+            model_used=row_dict.get("model_used"),
+            tokens_input=row_dict.get("tokens_input") or 0,
+            tokens_output=row_dict.get("tokens_output") or 0,
+            temporal_workflow_id=row_dict.get("temporal_workflow_id"),
+            temporal_run_id=row_dict.get("temporal_run_id"),
+            error_message=row_dict.get("error_message"),
+        )
+
 
 class PolecatStore:
     """
-    In-memory store for Polecat executions.
+    Database-backed store for Polecat executions.
 
-    In production, this would be backed by Redis or database.
+    Uses the polecat_executions table.
     """
 
     def __init__(self):
-        self._executions: dict[str, PolecatExecution] = {}
-        self._by_org: dict[str, list[str]] = {}  # org_id -> execution_ids
-        self._by_campaign: dict[str, list[str]] = {}  # campaign_id -> execution_ids
-        self._by_rig: dict[str, list[str]] = {}  # rig -> execution_ids
         self.logger = logger.bind(service="polecat_store")
+        # Keep in-memory task references for cancellation
+        self._tasks: dict[str, asyncio.Task] = {}
 
-    def create(self, execution: PolecatExecution) -> PolecatExecution:
+    async def create(self, session: AsyncSession, execution: PolecatExecution) -> PolecatExecution:
         """Store a new execution."""
-        self._executions[execution.id] = execution
+        query = text("""
+            INSERT INTO polecat_executions
+            (id, organization_id, campaign_id, polecat_type, rig, task_class,
+             input_bead_id, status, started_at)
+            VALUES (:id, :org_id, :campaign_id, :polecat_type, :rig, :task_class,
+                    :input_bead_id, :status, :started_at)
+        """)
 
-        # Index by organization
-        if execution.organization_id not in self._by_org:
-            self._by_org[execution.organization_id] = []
-        self._by_org[execution.organization_id].append(execution.id)
-
-        # Index by campaign
-        if execution.campaign_id:
-            if execution.campaign_id not in self._by_campaign:
-                self._by_campaign[execution.campaign_id] = []
-            self._by_campaign[execution.campaign_id].append(execution.id)
-
-        # Index by rig
-        if execution.rig not in self._by_rig:
-            self._by_rig[execution.rig] = []
-        self._by_rig[execution.rig].append(execution.id)
+        await session.execute(query, {
+            "id": execution.id,
+            "org_id": execution.organization_id,
+            "campaign_id": execution.campaign_id,
+            "polecat_type": execution.polecat_type,
+            "rig": execution.rig,
+            "task_class": execution.task_class or execution.polecat_type,
+            "input_bead_id": execution.bead_id,
+            "status": execution.status.value,
+            "started_at": execution.created_at,
+        })
+        await session.commit()
 
         self.logger.info(
             "Polecat execution created",
@@ -142,17 +188,68 @@ class PolecatStore:
         )
         return execution
 
-    def get(self, execution_id: str) -> PolecatExecution | None:
+    async def get(self, session: AsyncSession, execution_id: str) -> PolecatExecution | None:
         """Get an execution by ID."""
-        return self._executions.get(execution_id)
+        query = text("SELECT * FROM polecat_executions WHERE id = :id")
+        result = await session.execute(query, {"id": execution_id})
+        row = result.fetchone()
 
-    def update(self, execution: PolecatExecution) -> PolecatExecution:
-        """Update an execution."""
-        self._executions[execution.id] = execution
+        if not row:
+            return None
+
+        execution = PolecatExecution.from_row(dict(row._mapping))
+        # Restore task reference if exists
+        if execution.id in self._tasks:
+            execution._task = self._tasks[execution.id]
         return execution
 
-    def update_status(
+    async def update(self, session: AsyncSession, execution: PolecatExecution) -> PolecatExecution:
+        """Update an execution."""
+        query = text("""
+            UPDATE polecat_executions
+            SET status = :status,
+                started_at = :started_at,
+                completed_at = :completed_at,
+                duration_ms = :duration_ms,
+                output_bead_ids = :output_bead_ids,
+                refinery_scores = :refinery_scores,
+                refinery_passed = :refinery_passed,
+                witness_passed = :witness_passed,
+                witness_notes = :witness_notes,
+                model_used = :model_used,
+                tokens_input = :tokens_input,
+                tokens_output = :tokens_output,
+                temporal_workflow_id = :temporal_workflow_id,
+                temporal_run_id = :temporal_run_id,
+                error_message = :error_message
+            WHERE id = :id
+        """)
+
+        await session.execute(query, {
+            "id": execution.id,
+            "status": execution.status.value,
+            "started_at": execution.started_at,
+            "completed_at": execution.completed_at,
+            "duration_ms": execution.duration_ms,
+            "output_bead_ids": json.dumps(execution.output_bead_ids) if execution.output_bead_ids else None,
+            "refinery_scores": json.dumps(execution.refinery_scores) if execution.refinery_scores else None,
+            "refinery_passed": execution.refinery_passed,
+            "witness_passed": execution.witness_passed,
+            "witness_notes": execution.witness_notes,
+            "model_used": execution.model_used,
+            "tokens_input": execution.tokens_input,
+            "tokens_output": execution.tokens_output,
+            "temporal_workflow_id": execution.temporal_workflow_id,
+            "temporal_run_id": execution.temporal_run_id,
+            "error_message": execution.error_message,
+        })
+        await session.commit()
+
+        return execution
+
+    async def update_status(
         self,
+        session: AsyncSession,
         execution_id: str,
         status: PolecatStatus,
         error_message: str | None = None,
@@ -168,7 +265,7 @@ class PolecatStore:
         tokens_output: int | None = None,
     ) -> PolecatExecution | None:
         """Update execution status and results."""
-        execution = self._executions.get(execution_id)
+        execution = await self.get(session, execution_id)
         if not execution:
             return None
 
@@ -202,6 +299,8 @@ class PolecatStore:
         if tokens_output is not None:
             execution.tokens_output = tokens_output
 
+        await self.update(session, execution)
+
         self.logger.info(
             "Polecat execution updated",
             execution_id=execution_id,
@@ -209,8 +308,9 @@ class PolecatStore:
         )
         return execution
 
-    def list_executions(
+    async def list_executions(
         self,
+        session: AsyncSession,
         organization_id: str,
         rig: str | None = None,
         status: PolecatStatus | None = None,
@@ -219,52 +319,85 @@ class PolecatStore:
         offset: int = 0,
     ) -> tuple[list[PolecatExecution], int]:
         """List executions with filters."""
-        # Start with org filter
-        execution_ids = self._by_org.get(organization_id, [])
-        executions = [self._executions[eid] for eid in execution_ids if eid in self._executions]
+        conditions = ["organization_id = :org_id"]
+        params: dict[str, Any] = {"org_id": organization_id, "limit": limit, "offset": offset}
 
-        # Apply filters
         if rig:
-            executions = [e for e in executions if e.rig == rig]
+            conditions.append("rig = :rig")
+            params["rig"] = rig
         if status:
-            executions = [e for e in executions if e.status == status]
+            conditions.append("status = :status")
+            params["status"] = status.value
         if campaign_id:
-            executions = [e for e in executions if e.campaign_id == campaign_id]
+            conditions.append("campaign_id = :campaign_id")
+            params["campaign_id"] = campaign_id
 
-        # Sort by created_at descending (newest first)
-        executions.sort(key=lambda x: x.created_at, reverse=True)
+        where_clause = " AND ".join(conditions)
 
-        total = len(executions)
-        executions = executions[offset:offset + limit]
+        # Get total count
+        count_query = text(f"SELECT COUNT(*) as total FROM polecat_executions WHERE {where_clause}")
+        count_result = await session.execute(count_query, params)
+        total = count_result.fetchone()._mapping["total"]
+
+        # Get executions
+        query = text(f"""
+            SELECT * FROM polecat_executions
+            WHERE {where_clause}
+            ORDER BY started_at DESC
+            LIMIT :limit OFFSET :offset
+        """)
+        result = await session.execute(query, params)
+
+        executions = []
+        for row in result.fetchall():
+            executions.append(PolecatExecution.from_row(dict(row._mapping)))
 
         return executions, total
 
-    def get_running(self, organization_id: str | None = None) -> list[PolecatExecution]:
+    async def get_running(
+        self,
+        session: AsyncSession,
+        organization_id: str | None = None,
+    ) -> list[PolecatExecution]:
         """Get all running executions."""
         if organization_id:
-            execution_ids = self._by_org.get(organization_id, [])
-            executions = [self._executions[eid] for eid in execution_ids if eid in self._executions]
+            query = text("""
+                SELECT * FROM polecat_executions
+                WHERE organization_id = :org_id AND status = 'running'
+            """)
+            result = await session.execute(query, {"org_id": organization_id})
         else:
-            executions = list(self._executions.values())
+            query = text("SELECT * FROM polecat_executions WHERE status = 'running'")
+            result = await session.execute(query)
 
-        return [e for e in executions if e.status == PolecatStatus.RUNNING]
+        executions = []
+        for row in result.fetchall():
+            executions.append(PolecatExecution.from_row(dict(row._mapping)))
 
-    def get_orphaned(self, max_age_minutes: int = 30) -> list[PolecatExecution]:
+        return executions
+
+    async def get_orphaned(
+        self,
+        session: AsyncSession,
+        max_age_minutes: int = 30,
+    ) -> list[PolecatExecution]:
         """Get executions that have been running too long (potential orphans)."""
-        now = datetime.utcnow()
-        orphans = []
+        query = text("""
+            SELECT * FROM polecat_executions
+            WHERE status = 'running'
+            AND started_at < DATE_SUB(NOW(), INTERVAL :max_age MINUTE)
+        """)
+        result = await session.execute(query, {"max_age": max_age_minutes})
 
-        for execution in self._executions.values():
-            if execution.status == PolecatStatus.RUNNING and execution.started_at:
-                age_minutes = (now - execution.started_at).total_seconds() / 60
-                if age_minutes > max_age_minutes:
-                    orphans.append(execution)
+        orphans = []
+        for row in result.fetchall():
+            orphans.append(PolecatExecution.from_row(dict(row._mapping)))
 
         return orphans
 
-    def cancel(self, execution_id: str) -> PolecatExecution | None:
+    async def cancel(self, session: AsyncSession, execution_id: str) -> PolecatExecution | None:
         """Cancel an execution."""
-        execution = self._executions.get(execution_id)
+        execution = await self.get(session, execution_id)
         if not execution:
             return None
 
@@ -277,14 +410,27 @@ class PolecatStore:
             return execution
 
         # Cancel the task if it exists
-        if execution._task and not execution._task.done():
-            execution._task.cancel()
+        if execution_id in self._tasks:
+            task = self._tasks[execution_id]
+            if not task.done():
+                task.cancel()
+            del self._tasks[execution_id]
 
         execution.status = PolecatStatus.CANCELLED
         execution.completed_at = datetime.utcnow()
+        await self.update(session, execution)
 
         self.logger.info("Polecat execution cancelled", execution_id=execution_id)
         return execution
+
+    def register_task(self, execution_id: str, task: asyncio.Task):
+        """Register an asyncio task for an execution (for cancellation)."""
+        self._tasks[execution_id] = task
+
+    def unregister_task(self, execution_id: str):
+        """Unregister an asyncio task."""
+        if execution_id in self._tasks:
+            del self._tasks[execution_id]
 
 
 # Global singleton instance

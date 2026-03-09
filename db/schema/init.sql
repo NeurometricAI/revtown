@@ -519,6 +519,7 @@ CREATE TABLE IF NOT EXISTS approval_queue (
     bead_type VARCHAR(50) NOT NULL,
     bead_id VARCHAR(36) NOT NULL,
     polecat_execution_id VARCHAR(36),
+    polecat_type VARCHAR(100),
 
     -- Context
     rig VARCHAR(50) NOT NULL,

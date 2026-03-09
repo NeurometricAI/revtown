@@ -13,7 +13,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from apps.api.dependencies import CurrentUser, ScopedBeadStore
+from apps.api.dependencies import CurrentUser, DbSession, ScopedBeadStore
 from apps.api.core.approval_store import (
     ApprovalItem,
     ApprovalStatus,
@@ -65,7 +65,7 @@ class BulkDecision(BaseModel):
 
 @router.get("/queue", response_model=dict)
 async def get_approval_queue(
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
     status: ApprovalStatus = ApprovalStatus.PENDING,
     approval_type: ApprovalType | None = None,
@@ -82,7 +82,8 @@ async def get_approval_queue(
     approval_store = get_approval_store()
     org_id = str(user.organization_id) if user.organization_id else ""
 
-    items, total = approval_store.get_queue(
+    items, total = await approval_store.get_queue(
+        session=session,
         organization_id=org_id,
         status=status,
         approval_type=approval_type,
@@ -110,14 +111,14 @@ async def get_approval_queue(
 
 @router.get("/queue/counts", response_model=dict)
 async def get_queue_counts(
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
 ):
     """Get counts of items in each queue category."""
     approval_store = get_approval_store()
     org_id = str(user.organization_id) if user.organization_id else ""
 
-    counts = approval_store.get_counts(org_id)
+    counts = await approval_store.get_counts(session, org_id)
     return wrap_response(counts)
 
 
@@ -129,12 +130,12 @@ async def get_queue_counts(
 @router.get("/queue/{item_id}", response_model=dict)
 async def get_approval_item(
     item_id: str,
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
 ):
     """Get details of an approval queue item."""
     approval_store = get_approval_store()
-    item = approval_store.get(item_id)
+    item = await approval_store.get(session, item_id)
 
     if not item:
         raise HTTPException(status_code=404, detail="Approval item not found")
@@ -155,7 +156,7 @@ async def get_approval_item(
 @router.get("/queue/{item_id}/context", response_model=dict)
 async def get_approval_context(
     item_id: str,
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
 ):
     """
@@ -169,7 +170,7 @@ async def get_approval_context(
     - For PR pitches: journalist history
     """
     approval_store = get_approval_store()
-    item = approval_store.get(item_id)
+    item = await approval_store.get(session, item_id)
 
     if not item:
         raise HTTPException(status_code=404, detail="Approval item not found")
@@ -206,7 +207,7 @@ async def get_approval_context(
 async def make_decision(
     item_id: str,
     decision: ApprovalDecision,
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
 ):
     """
@@ -221,7 +222,7 @@ async def make_decision(
     and logged to the Bead ledger (audit trail).
     """
     approval_store = get_approval_store()
-    item = approval_store.get(item_id)
+    item = await approval_store.get(session, item_id)
 
     if not item:
         raise HTTPException(status_code=404, detail="Approval item not found")
@@ -234,7 +235,8 @@ async def make_decision(
         raise HTTPException(status_code=400, detail=f"Item already {item.status.value}")
 
     # Make the decision
-    updated_item = approval_store.decide(
+    updated_item = await approval_store.decide(
+        session=session,
         item_id=item_id,
         decision=decision.decision,
         user_id=str(user.user_id),
@@ -257,14 +259,14 @@ async def make_decision(
 @router.post("/queue/{item_id}/approve", response_model=dict)
 async def quick_approve(
     item_id: str,
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
 ):
     """Quick approve an item (one-click)."""
     return await make_decision(
         item_id,
         ApprovalDecision(decision=ApprovalStatus.APPROVED),
-        store,
+        session,
         user,
     )
 
@@ -272,15 +274,15 @@ async def quick_approve(
 @router.post("/queue/{item_id}/reject", response_model=dict)
 async def quick_reject(
     item_id: str,
+    session: DbSession,
+    user: CurrentUser,
     reason: str | None = None,
-    store: ScopedBeadStore = None,
-    user: CurrentUser = None,
 ):
     """Quick reject an item."""
     return await make_decision(
         item_id,
         ApprovalDecision(decision=ApprovalStatus.REJECTED, notes=reason),
-        store,
+        session,
         user,
     )
 
@@ -293,7 +295,7 @@ async def quick_reject(
 @router.post("/queue/bulk-decide", response_model=dict)
 async def bulk_decide(
     bulk: BulkDecision,
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
 ):
     """Make the same decision on multiple items."""
@@ -302,7 +304,7 @@ async def bulk_decide(
 
     results = []
     for item_id in bulk.item_ids:
-        item = approval_store.get(item_id)
+        item = await approval_store.get(session, item_id)
         if not item or item.organization_id != org_id:
             results.append({"item_id": item_id, "status": "not_found"})
             continue
@@ -311,7 +313,8 @@ async def bulk_decide(
             results.append({"item_id": item_id, "status": f"already_{item.status.value}"})
             continue
 
-        updated = approval_store.decide(
+        updated = await approval_store.decide(
+            session=session,
             item_id=item_id,
             decision=bulk.decision,
             user_id=str(user.user_id),
@@ -340,7 +343,7 @@ async def bulk_decide(
 
 @router.get("/audit-log", response_model=dict)
 async def get_audit_log(
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
     action: str | None = None,
     user_id: str | None = None,
@@ -351,7 +354,8 @@ async def get_audit_log(
     approval_store = get_approval_store()
     org_id = str(user.organization_id) if user.organization_id else ""
 
-    entries, total = approval_store.get_audit_log(
+    entries, total = await approval_store.get_audit_log(
+        session=session,
         organization_id=org_id,
         action=action,
         user_id=user_id,
@@ -372,7 +376,7 @@ async def get_audit_log(
 
 @router.get("/queue/pr-pitches", response_model=dict)
 async def get_pr_pitch_queue(
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
     limit: int = Query(50, le=200),
 ):
@@ -385,7 +389,8 @@ async def get_pr_pitch_queue(
     approval_store = get_approval_store()
     org_id = str(user.organization_id) if user.organization_id else ""
 
-    items, total = approval_store.get_queue(
+    items, total = await approval_store.get_queue(
+        session=session,
         organization_id=org_id,
         status=ApprovalStatus.PENDING,
         approval_type=ApprovalType.PR_PITCH,
@@ -405,7 +410,7 @@ async def get_pr_pitch_queue(
 
 @router.get("/queue/sms", response_model=dict)
 async def get_sms_queue(
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
     limit: int = Query(50, le=200),
 ):
@@ -418,7 +423,8 @@ async def get_sms_queue(
     approval_store = get_approval_store()
     org_id = str(user.organization_id) if user.organization_id else ""
 
-    items, total = approval_store.get_queue(
+    items, total = await approval_store.get_queue(
+        session=session,
         organization_id=org_id,
         status=ApprovalStatus.PENDING,
         approval_type=ApprovalType.SMS,
@@ -438,7 +444,7 @@ async def get_sms_queue(
 
 @router.get("/queue/test-winners", response_model=dict)
 async def get_test_winner_queue(
-    store: ScopedBeadStore,
+    session: DbSession,
     user: CurrentUser,
     limit: int = Query(50, le=200),
 ):
@@ -450,7 +456,8 @@ async def get_test_winner_queue(
     approval_store = get_approval_store()
     org_id = str(user.organization_id) if user.organization_id else ""
 
-    items, total = approval_store.get_queue(
+    items, total = await approval_store.get_queue(
+        session=session,
         organization_id=org_id,
         status=ApprovalStatus.PENDING,
         approval_type=ApprovalType.TEST_WINNER,

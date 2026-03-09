@@ -21,6 +21,7 @@ from apps.api.core.neurometric import get_neurometric_client
 from apps.api.core.approval_store import (
     ApprovalItem, ApprovalType, ApprovalStatus, Urgency, get_approval_store
 )
+from apps.api.dependencies import get_session_factory
 
 logger = structlog.get_logger()
 
@@ -361,7 +362,10 @@ class ConvoyExecutor:
             witness_passed=result.get("witness_passed", True),
         )
 
-        self.approval_store.create(item)
+        # Create session for database operation
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            await self.approval_store.create(session, item)
 
         self.logger.info(
             "Queued step for approval",
