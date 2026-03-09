@@ -7,14 +7,20 @@ Human-in-the-loop checkpoint for all high-stakes outputs.
 """
 
 from datetime import datetime
-from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from apps.api.dependencies import CurrentUser, DbSession, ScopedBeadStore
+from apps.api.dependencies import CurrentUser, ScopedBeadStore
+from apps.api.core.approval_store import (
+    ApprovalItem,
+    ApprovalStatus,
+    ApprovalType,
+    Urgency,
+    get_approval_store,
+)
 
 router = APIRouter()
 
@@ -32,32 +38,8 @@ def wrap_response(data: Any, meta: dict[str, Any] | None = None) -> dict[str, An
 
 
 # =============================================================================
-# Enums & Models
+# Request/Response Models
 # =============================================================================
-
-
-class ApprovalType(str, Enum):
-    CONTENT = "content"
-    OUTREACH = "outreach"
-    PR_PITCH = "pr_pitch"
-    SMS = "sms"
-    TEST_WINNER = "test_winner"
-    OTHER = "other"
-
-
-class ApprovalStatus(str, Enum):
-    PENDING = "pending"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    SENT_BACK = "sent_back"
-    EXPIRED = "expired"
-
-
-class Urgency(str, Enum):
-    LOW = "low"
-    NORMAL = "normal"
-    HIGH = "high"
-    CRITICAL = "critical"
 
 
 class ApprovalDecision(BaseModel):
@@ -68,22 +50,12 @@ class ApprovalDecision(BaseModel):
     edited_content: str | None = None  # If approving with modifications
 
 
-class ApprovalItem(BaseModel):
-    """An item in the approval queue."""
+class BulkDecision(BaseModel):
+    """Bulk decision on multiple items."""
 
-    id: UUID
-    bead_type: str
-    bead_id: UUID
-    rig: str
-    approval_type: ApprovalType
-    urgency: Urgency
-    preview_title: str | None
-    preview_content: str | None
-    refinery_scores: dict[str, Any] | None
-    refinery_warnings: list[str] | None
-    status: ApprovalStatus
-    created_at: datetime
-    expires_at: datetime | None
+    item_ids: list[str]
+    decision: ApprovalStatus
+    notes: str | None = None
 
 
 # =============================================================================
@@ -107,18 +79,30 @@ async def get_approval_queue(
 
     By default returns pending items sorted by urgency and creation time.
     """
-    # TODO: Query approval_queue table
+    approval_store = get_approval_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
+
+    items, total = approval_store.get_queue(
+        organization_id=org_id,
+        status=status,
+        approval_type=approval_type,
+        rig=rig,
+        urgency=urgency,
+        limit=limit,
+        offset=offset,
+    )
+
     return wrap_response(
-        [],
+        [item.to_dict() for item in items],
         meta={
-            "count": 0,
+            "count": total,
             "limit": limit,
             "offset": offset,
             "filters": {
-                "status": status,
-                "approval_type": approval_type,
+                "status": status.value if status else None,
+                "approval_type": approval_type.value if approval_type else None,
                 "rig": rig,
-                "urgency": urgency,
+                "urgency": urgency.value if urgency else None,
             },
         },
     )
@@ -130,25 +114,11 @@ async def get_queue_counts(
     user: CurrentUser,
 ):
     """Get counts of items in each queue category."""
-    # TODO: Aggregate from approval_queue table
-    return wrap_response({
-        "total_pending": 0,
-        "by_type": {
-            "content": 0,
-            "outreach": 0,
-            "pr_pitch": 0,
-            "sms": 0,
-            "test_winner": 0,
-            "other": 0,
-        },
-        "by_urgency": {
-            "critical": 0,
-            "high": 0,
-            "normal": 0,
-            "low": 0,
-        },
-        "by_rig": {},
-    })
+    approval_store = get_approval_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
+
+    counts = approval_store.get_counts(org_id)
+    return wrap_response(counts)
 
 
 # =============================================================================
@@ -158,26 +128,33 @@ async def get_queue_counts(
 
 @router.get("/queue/{item_id}", response_model=dict)
 async def get_approval_item(
-    item_id: UUID,
+    item_id: str,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
     """Get details of an approval queue item."""
-    # TODO: Look up in approval_queue table
+    approval_store = get_approval_store()
+    item = approval_store.get(item_id)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Approval item not found")
+
+    # Verify organization access
+    org_id = str(user.organization_id) if user.organization_id else ""
+    if item.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Approval item not found")
+
     return wrap_response({
-        "id": str(item_id),
-        "status": "pending",
-        "bead": None,
-        "bead_history": [],
-        "refinery_details": None,
-        "witness_details": None,
-        "polecat_execution": None,
+        "item": item.to_dict(),
+        "full_content": item.full_content,
+        "bead": None,  # TODO: Load from BeadStore
+        "bead_history": [],  # TODO: Load from BeadStore
     })
 
 
 @router.get("/queue/{item_id}/context", response_model=dict)
 async def get_approval_context(
-    item_id: UUID,
+    item_id: str,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
@@ -191,21 +168,32 @@ async def get_approval_context(
     - Witness check results
     - For PR pitches: journalist history
     """
+    approval_store = get_approval_store()
+    item = approval_store.get(item_id)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Approval item not found")
+
+    org_id = str(user.organization_id) if user.organization_id else ""
+    if item.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Approval item not found")
+
     return wrap_response({
-        "item_id": str(item_id),
-        "bead": None,
+        "item_id": item_id,
+        "item": item.to_dict(),
+        "full_content": item.full_content,
+        "bead": None,  # TODO: Load from BeadStore
         "related_beads": [],
         "refinery": {
-            "scores": {},
-            "warnings": [],
-            "passed": True,
+            "scores": item.refinery_scores,
+            "warnings": item.refinery_warnings,
+            "passed": item.refinery_passed,
         },
         "witness": {
-            "contradictions": [],
-            "duplicates": [],
-            "passed": True,
+            "issues": item.witness_issues,
+            "passed": item.witness_passed,
         },
-        "history": [],
+        "history": [],  # TODO: Load from BeadStore
     })
 
 
@@ -216,7 +204,7 @@ async def get_approval_context(
 
 @router.post("/queue/{item_id}/decide", response_model=dict)
 async def make_decision(
-    item_id: UUID,
+    item_id: str,
     decision: ApprovalDecision,
     store: ScopedBeadStore,
     user: CurrentUser,
@@ -232,19 +220,43 @@ async def make_decision(
     The decision is signed with the authenticated user's identity
     and logged to the Bead ledger (audit trail).
     """
-    # TODO: Update approval_queue, log to audit_log
+    approval_store = get_approval_store()
+    item = approval_store.get(item_id)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Approval item not found")
+
+    org_id = str(user.organization_id) if user.organization_id else ""
+    if item.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Approval item not found")
+
+    if item.status != ApprovalStatus.PENDING:
+        raise HTTPException(status_code=400, detail=f"Item already {item.status.value}")
+
+    # Make the decision
+    updated_item = approval_store.decide(
+        item_id=item_id,
+        decision=decision.decision,
+        user_id=str(user.user_id),
+        notes=decision.notes,
+        edited_content=decision.edited_content,
+    )
+
+    if not updated_item:
+        raise HTTPException(status_code=500, detail="Failed to update item")
+
     return wrap_response({
-        "item_id": str(item_id),
-        "decision": decision.decision,
+        "item_id": item_id,
+        "decision": decision.decision.value,
         "decided_by": str(user.user_id),
-        "decided_at": datetime.utcnow().isoformat(),
+        "decided_at": updated_item.decided_at.isoformat() if updated_item.decided_at else None,
         "notes": decision.notes,
     })
 
 
 @router.post("/queue/{item_id}/approve", response_model=dict)
 async def quick_approve(
-    item_id: UUID,
+    item_id: str,
     store: ScopedBeadStore,
     user: CurrentUser,
 ):
@@ -259,7 +271,7 @@ async def quick_approve(
 
 @router.post("/queue/{item_id}/reject", response_model=dict)
 async def quick_reject(
-    item_id: UUID,
+    item_id: str,
     reason: str | None = None,
     store: ScopedBeadStore = None,
     user: CurrentUser = None,
@@ -278,14 +290,6 @@ async def quick_reject(
 # =============================================================================
 
 
-class BulkDecision(BaseModel):
-    """Bulk decision on multiple items."""
-
-    item_ids: list[UUID]
-    decision: ApprovalStatus
-    notes: str | None = None
-
-
 @router.post("/queue/bulk-decide", response_model=dict)
 async def bulk_decide(
     bulk: BulkDecision,
@@ -293,14 +297,39 @@ async def bulk_decide(
     user: CurrentUser,
 ):
     """Make the same decision on multiple items."""
-    # TODO: Implement bulk update
+    approval_store = get_approval_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
+
+    results = []
+    for item_id in bulk.item_ids:
+        item = approval_store.get(item_id)
+        if not item or item.organization_id != org_id:
+            results.append({"item_id": item_id, "status": "not_found"})
+            continue
+
+        if item.status != ApprovalStatus.PENDING:
+            results.append({"item_id": item_id, "status": f"already_{item.status.value}"})
+            continue
+
+        updated = approval_store.decide(
+            item_id=item_id,
+            decision=bulk.decision,
+            user_id=str(user.user_id),
+            notes=bulk.notes,
+        )
+
+        if updated:
+            results.append({"item_id": item_id, "status": "processed"})
+        else:
+            results.append({"item_id": item_id, "status": "failed"})
+
+    processed = len([r for r in results if r["status"] == "processed"])
+
     return wrap_response({
-        "processed": len(bulk.item_ids),
-        "decision": bulk.decision,
-        "results": [
-            {"item_id": str(item_id), "status": "processed"}
-            for item_id in bulk.item_ids
-        ],
+        "processed": processed,
+        "total": len(bulk.item_ids),
+        "decision": bulk.decision.value,
+        "results": results,
     })
 
 
@@ -314,16 +343,25 @@ async def get_audit_log(
     store: ScopedBeadStore,
     user: CurrentUser,
     action: str | None = None,
-    user_id: UUID | None = None,
-    entity_type: str | None = None,
+    user_id: str | None = None,
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
 ):
     """Get the approval audit log."""
-    # TODO: Query audit_log table
+    approval_store = get_approval_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
+
+    entries, total = approval_store.get_audit_log(
+        organization_id=org_id,
+        action=action,
+        user_id=user_id,
+        limit=limit,
+        offset=offset,
+    )
+
     return wrap_response(
-        [],
-        meta={"count": 0, "limit": limit, "offset": offset},
+        [entry.to_dict() for entry in entries],
+        meta={"count": total, "limit": limit, "offset": offset},
     )
 
 
@@ -344,10 +382,19 @@ async def get_pr_pitch_queue(
     PR pitches ALWAYS require human approval - no exceptions.
     Includes journalist relationship history for context.
     """
-    # TODO: Query with journalist history join
+    approval_store = get_approval_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
+
+    items, total = approval_store.get_queue(
+        organization_id=org_id,
+        status=ApprovalStatus.PENDING,
+        approval_type=ApprovalType.PR_PITCH,
+        limit=limit,
+    )
+
     return wrap_response(
-        [],
-        meta={"count": 0, "limit": limit},
+        [item.to_dict() for item in items],
+        meta={"count": total, "limit": limit},
     )
 
 
@@ -368,9 +415,19 @@ async def get_sms_queue(
     SMS messages ALWAYS require human approval - no exceptions.
     The Wire is human-assisted only.
     """
+    approval_store = get_approval_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
+
+    items, total = approval_store.get_queue(
+        organization_id=org_id,
+        status=ApprovalStatus.PENDING,
+        approval_type=ApprovalType.SMS,
+        limit=limit,
+    )
+
     return wrap_response(
-        [],
-        meta={"count": 0, "limit": limit},
+        [item.to_dict() for item in items],
+        meta={"count": total, "limit": limit},
     )
 
 
@@ -390,7 +447,17 @@ async def get_test_winner_queue(
 
     Test winner declarations require human approval before promotion.
     """
+    approval_store = get_approval_store()
+    org_id = str(user.organization_id) if user.organization_id else ""
+
+    items, total = approval_store.get_queue(
+        organization_id=org_id,
+        status=ApprovalStatus.PENDING,
+        approval_type=ApprovalType.TEST_WINNER,
+        limit=limit,
+    )
+
     return wrap_response(
-        [],
-        meta={"count": 0, "limit": limit},
+        [item.to_dict() for item in items],
+        meta={"count": total, "limit": limit},
     )

@@ -58,7 +58,7 @@ class Witness:
 
     def __init__(
         self,
-        bead_store: BeadStore,
+        bead_store: BeadStore | None = None,
         neurometric: NeurometricClient | None = None,
         organization_id: UUID | None = None,
     ):
@@ -339,7 +339,7 @@ Respond with JSON:
 
 
 def get_witness(
-    bead_store: BeadStore,
+    bead_store: BeadStore | None = None,
     organization_id: UUID | None = None,
 ) -> Witness:
     """Get a Witness instance."""

@@ -286,7 +286,7 @@ class BasePolecat(ABC):
             "bead_id": str(self.bead_id),
             "bead_type": self.context.bead_type if self.context else None,
             "campaign_id": str(self.context.campaign_id) if self.context and self.context.campaign_id else None,
-            **self.context.bead_data if self.context else {},
+            **(self.context.bead_data if self.context else {}),
         }
 
         return await self.refinery.check(
@@ -315,7 +315,7 @@ class BasePolecat(ABC):
             "bead_type": self.context.bead_type if self.context else None,
             "campaign_id": str(self.context.campaign_id) if self.context and self.context.campaign_id else None,
             "refinery_passed": refinery_result.passed,
-            **self.context.bead_data if self.context else {},
+            **(self.context.bead_data if self.context else {}),
         }
 
         return await self.witness.verify(
