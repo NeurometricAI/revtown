@@ -12,7 +12,11 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from apps.api.dependencies import CurrentUser, ScopedBeadStore, ScopedMayor
+from apps.api.config import settings
+from apps.api.dependencies import (
+    OptionalUser, OptionalBeadStore, OptionalMayor, TokenData,
+    CurrentUser, ScopedBeadStore, ScopedMayor,
+)
 from apps.api.core.convoy_store import (
     Convoy, ConvoyStatus, ConvoyStep, StepStatus, get_convoy_store
 )
@@ -63,9 +67,9 @@ _conversations: dict[str, list[ChatMessage]] = {}
 @router.post("/chat", response_model=dict)
 async def chat_with_mayor(
     request: ChatRequest,
-    store: ScopedBeadStore,
-    user: CurrentUser,
-    mayor: ScopedMayor,
+    store: OptionalBeadStore,
+    user: OptionalUser,
+    mayor: OptionalMayor,
 ):
     """
     Chat with the GTM Mayor.
@@ -77,6 +81,18 @@ async def chat_with_mayor(
     - Provide status updates
     - Ask clarifying questions
     """
+    # In development mode, allow unauthenticated access with a dev user
+    if user is None:
+        if settings.revtown_env != "development":
+            raise HTTPException(status_code=401, detail="Authentication required")
+        # Create a dev user for development mode
+        user = TokenData(
+            user_id="dev-user-id",
+            email="dev@localhost",
+            organization_id="dev-org-id",
+            role="owner",
+        )
+
     # Build context from conversation history
     history = request.conversation_history
 

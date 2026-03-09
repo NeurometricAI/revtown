@@ -222,6 +222,15 @@ async def get_bead_store_unscoped(
     return BeadStore(session, None)
 
 
+async def get_bead_store_optional(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    user: Annotated[TokenData | None, Depends(get_current_user_optional)],
+) -> BeadStore:
+    """Get a BeadStore, using dev org if no user (dev mode only)."""
+    org_id = user.organization_id if user else "dev-org-id"
+    return BeadStore(session, org_id)
+
+
 # =============================================================================
 # Type Aliases for Common Dependencies
 # =============================================================================
@@ -254,4 +263,20 @@ async def get_mayor(
     )
 
 
+async def get_mayor_optional(
+    store: Annotated[BeadStore, Depends(get_bead_store_optional)],
+    user: Annotated[TokenData | None, Depends(get_current_user_optional)],
+):
+    """Get a Mayor instance, using dev org if no user (dev mode only)."""
+    from apps.api.core.mayor import Mayor
+
+    org_id = user.organization_id if user else "dev-org-id"
+    return Mayor(
+        bead_store=store,
+        organization_id=org_id,
+    )
+
+
 ScopedMayor = Annotated["Mayor", Depends(get_mayor)]
+OptionalMayor = Annotated["Mayor", Depends(get_mayor_optional)]
+OptionalBeadStore = Annotated[BeadStore, Depends(get_bead_store_optional)]
