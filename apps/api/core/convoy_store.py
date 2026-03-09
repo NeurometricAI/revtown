@@ -98,10 +98,13 @@ class Convoy:
     @property
     def ready_steps(self) -> list[ConvoyStep]:
         """Steps that are ready to execute (dependencies satisfied)."""
+        # Build set of completed step IDs and polecat types for dependency matching
         completed_ids = {s.id for s in self.steps if s.status == StepStatus.COMPLETED}
+        completed_types = {s.polecat_type for s in self.steps if s.status == StepStatus.COMPLETED}
+        completed_all = completed_ids | completed_types
         return [
             s for s in self.steps
-            if s.status == StepStatus.PENDING and all(d in completed_ids for d in s.depends_on)
+            if s.status == StepStatus.PENDING and all(d in completed_all for d in s.depends_on)
         ]
 
     def to_dict(self) -> dict[str, Any]:
